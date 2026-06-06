@@ -1,0 +1,80 @@
+{
+  "dry_run": true,
+  "mt5": {
+    "terminal_path": "/Applications/MetaTrader 5.app/Contents/MacOS/metatrader5",
+    "login": null,
+    "password": "",
+    "server": "",
+    "magic": 990001,
+    "deviation": 20,
+    "comment": "tv-bridge",
+    "filling_mode": "auto"
+  },
+  "mt5_profiles": {
+    "sub_account": {
+      "terminal_path": "",
+      "login": null,
+      "password": "",
+      "server": "",
+      "magic": 990002,
+      "deviation": 20,
+      "comment": "tv-bridge-sub",
+      "filling_mode": "auto"
+    }
+  },
+  "routing": {
+    "default_profile": "default",
+    "dedupe_same_terminal": true,
+    "symbol_profiles": {
+      "XAUUSD": ["default", "sub_account"]
+    },
+    "strategy_profiles": {
+      "wemof_original": "default"
+    }
+  },
+  "webhook": {
+    "host": "0.0.0.0",
+    "port": 8181,
+    "secret": "CHANGE_ME"
+  },
+  "discord": {
+    "enabled": false,
+    "webhook_url": "",
+    "username": "半裁量アラート",
+    "avatar_url": ""
+  },
+  "symbols": {
+    "aliases": {
+      "NASDAQ": ["USTEC", "NAS100", "US100", "NAS"],
+      "XAUUSD": ["GOLD", "XAU"],
+      "GBPJPY": ["GBPJPY", "GBP/JPY"]
+    },
+    "explicit_map": {
+      "NASDAQ": "USTEC.cash"
+    },
+    "prefixes": ["", "#", "m."],
+    "suffixes": ["", ".m", "m", ".pro", "_pro", ".ecn", "-ecn", ".cash"],
+    "refresh_seconds": 300
+  },
+  "risk": {
+    "default_lot": 0.1,
+    "per_symbol": {
+      "NASDAQ": 0.2,
+      "XAUUSD": 0.05,
+      "GBPJPY": 0.1
+    },
+    "per_profile": {
+      "sub_account": 0.02
+    },
+    "per_profile_symbol": {
+      "sub_account": {
+        "XAUUSD": 0.01
+      }
+    },
+    "min_lot": 0.01,
+    "max_lot": 10.0
+  },
+  "entry": {
+    "skip_same_side_position": true
+  }
+}

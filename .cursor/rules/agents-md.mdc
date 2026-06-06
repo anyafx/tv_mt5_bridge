@@ -1,0 +1,9 @@
+---
+description: tv_mt5_bridge 共通のAIエージェント向けガイド
+alwaysApply: true
+---
+
+# AGENTS.md を参照すること
+
+リポジトリルートの `AGENTS.md` に、TradingView -> MT5 Bridge の開発ルール、実注文リスク、コーディング規約、セキュリティ方針、検証手順が集約されている。
+コード変更や提案を行う前に必ず確認し、記載されたルールに従うこと。
