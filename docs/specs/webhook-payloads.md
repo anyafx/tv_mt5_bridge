@@ -243,7 +243,7 @@ MT5 の `symbols_get()` から取得したシンボル一覧に対して、`pref
 }
 ```
 
-完全一致、正規化一致、prefix/suffix 探索、類似スコア探索の順で `resolved_symbol` を決定する。見つからない場合は canonical symbol をそのまま返す。
+完全一致、正規化一致、prefix/suffix 探索、類似スコア探索の順で `resolved_symbol` を決定する。見つからない場合は canonical symbol をそのまま返す。類似スコア探索は正規化後3文字未満の候補には適用しない。誤って抽出された断片（時刻表記の一部など）が無関係な実シンボルに部分一致してしまうのを防ぐための下限で、一致時はログに `Symbol resolved via fuzzy match` の warning を出す。
 
 ## lot 解決
 

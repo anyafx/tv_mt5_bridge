@@ -356,6 +356,8 @@ strategy fill alert の場合は、同じ `resolved_symbol` かつ同じ strateg
 }
 ```
 
+`symbol_select failed: 24` のように、シンボル名が数字だけ・2文字未満など明らかに実際の銘柄コードではない場合は、プレーンテキスト alert の symbol 自動推定が本文中の別の断片（時刻表記の `22:24` など）を誤って拾っている可能性が高い。`raw_symbol` / `canonical_symbol` がそもそも想定した銘柄になっているか確認し、なっていなければ発生源の alert フォーマットに対して明示的に symbol を設定する処理を追加する（玉暴威の `【確定】` 処理と同様）。ログに `Symbol resolved via fuzzy match` の warning が出ている場合も、`raw_symbol` が意図した銘柄コードかどうかを必ず確認する。
+
 ### MT5 接続に失敗する
 
 確認項目:
@@ -407,4 +409,5 @@ strategy fill alert の場合は、同じ `resolved_symbol` かつ同じ strateg
 - `dry_run: true` で `buy` / `sell` / `close_all` のテストが通る
 - `resolved_symbol` と `lot` が想定どおり
 - `webhook.secret` が実運用値に変更されている
+- 設定ファイルまたは `bridge.py` を変更した後は、プロセスを完全に停止してから再起動し、起動ログのタイムスタンプで新プロセスに入れ替わったことを確認する。旧プロセスを停止せずに起動すると `webhook.port` の競合で新プロセスの起動が失敗し、気づかないまま旧プロセスが動き続けることがある
 - `dry_run: false` への切り替え前にデモ口座または最小ロットで検証した

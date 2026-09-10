@@ -298,6 +298,10 @@ Gate Breaker T-L: {{ticker}} で {{strategy.order.action}} @ {{strategy.order.co
 
 各 alert は MT5 order comment を `tv-bridge-r15` / `tv-bridge-r15a` / `tv-bridge-r30` / `tv-bridge-r30a` / `tv-bridge-rem` / `tv-bridge-wem` / `tv-bridge-gbtl` に分けます。`entry.skip_same_side_position` が `true` の場合は、この comment 単位で同方向ポジションを判定します。`entry.skip_same_side_across_strategies` が `true` の場合は comment に関係なく、同一MT5口座・シンボル・方向で1ポジに制限します。
 
+### 玉暴威アラート
+
+玉暴威インジケーターの alert は `【予告】` `【候補】` `【確定】` `【取消】` `【包足】` のいずれかのタグで始まるプレーンテキストです。`【確定】` 以外はスキップし、`【確定】` のみ本文の `BUY` / `SELL` から action を推定して発注します。symbol は本文にシンボル情報が含まれないため `XAUUSD` 固定です。詳細は [docs/specs/webhook-payloads.md](docs/specs/webhook-payloads.md#玉暴威アラートの確定フィルタ) を参照してください。
+
 ## 運用
 
 - まず `dry_run: true` で JSON payload とレスポンスを確認してください。
