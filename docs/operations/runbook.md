@@ -34,9 +34,47 @@ cp config.example.json config.json
 | `routing` | symbol / strategy ごとの発注先 profile |
 | `webhook.secret` | TradingView payload と一致する shared secret |
 | `webhook.host` / `port` | HTTP サーバーの bind 先 |
+| `trading_pause` | 指標や市場オープン前後など、注文を止めるJST時間帯 |
+| `news_filter` | Gaikaex 経済指標カレンダーで関連通貨の entry を止める設定 |
 | `symbols.explicit_map` | ブローカー固有シンボルを固定したい場合に設定 |
 | `risk.default_lot` / `per_symbol` | 想定ロット |
 | `entry.skip_same_side_position` | 重複エントリー抑止の有無 |
+| `entry.skip_same_side_across_strategies` | 全strategy横断で同一シンボル・同方向を1ポジに制限するか |
+
+停止時間を使う場合:
+
+```json
+"trading_pause": {
+  "enabled": true,
+  "timezone": "Asia/Tokyo",
+  "entry_only": true,
+  "notify_on_skip": true,
+  "windows": [
+    {"start": "08:55", "end": "09:10", "label": "Tokyo open"},
+    {"start": "21:25", "end": "21:40", "label": "Economic indicator"}
+  ]
+}
+```
+
+`HH:MM` は日本時間で指定する。`23:55` から `00:10` のような日跨ぎも指定できる。停止中のWebhookは `reason: "trading_pause"` でskipされ、MT5注文は送られない。
+
+デフォルトでは entry / close の両方と Discord 通知を止める。`entry_only: true` なら新規エントリーだけ止めて決済は通す。`notify_on_skip: true` なら、止めたエントリーでも Discord 通知は送る。
+
+経済指標カレンダーで止める場合:
+
+```json
+"news_filter": {
+  "enabled": true,
+  "minutes_before": 15,
+  "minutes_after": 15,
+  "impact_filter": "medium_high",
+  "refresh_seconds": 300,
+  "notify_on_skip": true,
+  "skip_on_fetch_error": false
+}
+```
+
+Gaikaex のカレンダーから当日の中・高重要度指標を取得し、USDJPY は USD/JPY、XAUUSD や NASDAQ 系は USD の指標前後で entry を `news_filter` としてスキップする。`notify_on_skip: true` の場合はDiscord通知自体は送り、embed内にニュース理由を追加する。`skip_on_fetch_error: false` では取得失敗時に発注を止めない。
 
 ## 起動
 
@@ -289,12 +327,13 @@ payload 側で直接指定することもできる。
 `entry.skip_same_side_position` が `true` の場合、同じ `resolved_symbol` で同方向ポジションがあると新規エントリーをスキップする。
 
 strategy fill alert の場合は、同じ `resolved_symbol` かつ同じ strategy comment suffix を持つポジションだけを重複判定する。たとえば `tv-bridge-r30a` と `tv-bridge-1-r30a` は同じ 30m active として扱う。15m / 15m active / 30m / 30m active / REM default / Wemof / Gate Breaker T-L は独立して扱う。
-同じ strategy entry が複数アプリからほぼ同時に来る場合は、MT5 の positions 反映前でも短時間の pending marker で `duplicate_entry_pending` としてスキップする。
+`entry.skip_same_side_across_strategies` が `true` の場合はstrategy commentを区別せず、同じMT5口座・`resolved_symbol`・方向に1つでもポジションがあればスキップする。この設定は `entry.skip_same_side_position` が `false` でも有効になる。
+`entry.skip_same_side_position` が `true` の場合、通常Webhookも同じMT5口座・`resolved_symbol`・方向で短時間の pending marker を取得する。同じ entry が複数アプリからほぼ同時に来ても、MT5 の positions 反映前に2件目以降を `duplicate_entry_pending` としてスキップする。strategy fill alert は同じstrategy単位で判定する。
 
 対応:
 
 - 意図どおりなら正常。
-- 重複エントリーを許可したい場合は `entry.skip_same_side_position` を `false` に変更して再起動する。
+- 重複エントリーを許可したい場合は `entry.skip_same_side_position` と `entry.skip_same_side_across_strategies` を両方 `false` に変更して再起動する。
 - 別シンボルとして扱われている可能性がある場合は `resolved_symbol` を確認する。
 
 ### シンボルが期待どおり解決されない

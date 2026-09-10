@@ -41,7 +41,39 @@
     "enabled": false,
     "webhook_url": "",
     "username": "半裁量アラート",
-    "avatar_url": ""
+    "avatar_url": "",
+    "rate_limit_seconds": {
+      "wemof_original": 300
+    }
+  },
+  "trading_pause": {
+    "enabled": false,
+    "timezone": "Asia/Tokyo",
+    "entry_only": false,
+    "notify_on_skip": false,
+    "windows": [
+      {
+        "start": "08:55",
+        "end": "09:10",
+        "label": "Tokyo open"
+      },
+      {
+        "start": "21:25",
+        "end": "21:40",
+        "label": "Economic indicator"
+      }
+    ]
+  },
+  "news_filter": {
+    "enabled": false,
+    "source_url": "https://www.gaikaex.com/gaikaex/mark/calendar/",
+    "timezone": "Asia/Tokyo",
+    "minutes_before": 15,
+    "minutes_after": 15,
+    "impact_filter": "medium_high",
+    "refresh_seconds": 300,
+    "notify_on_skip": true,
+    "skip_on_fetch_error": false
   },
   "symbols": {
     "aliases": {
@@ -75,6 +107,7 @@
     "max_lot": 10.0
   },
   "entry": {
-    "skip_same_side_position": true
+    "skip_same_side_position": true,
+    "skip_same_side_across_strategies": false
   }
 }

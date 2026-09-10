@@ -9,3 +9,4 @@ venv/
 
 config.json
 *.log
+TradingView_Alerts_Log_*.csv

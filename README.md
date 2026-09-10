@@ -134,9 +134,15 @@ curl -X POST http://127.0.0.1:8181/webhook \
 | `mt5_profiles` | profile名ごとの `mt5` 設定 | 複数 MT5 端末・口座を使う場合の追加プロファイル |
 | `routing` | `default_profile`, `dedupe_same_terminal`, `symbol_profiles`, `strategy_profiles` | payload / symbol / strategy ごとの発注先 profile |
 | `webhook` | `host`, `port`, `secret` | HTTP サーバーの bind 先と shared secret |
+| `trading_pause` | `enabled`, `timezone`, `entry_only`, `notify_on_skip`, `windows` | JST指定の時間帯に注文をスキップする |
+| `news_filter` | `enabled`, `minutes_before`, `minutes_after`, `impact_filter`, `notify_on_skip` | Gaikaex 経済指標カレンダーを取得し、関連通貨の指標前後だけ entry をスキップする |
 | `symbols` | `aliases`, `explicit_map`, `prefixes`, `suffixes`, `refresh_seconds` | TradingView シンボルから MT5 シンボルへの変換ルール |
 | `risk` | `default_lot`, `per_symbol`, `min_lot`, `max_lot` | ロット解決と上下限 |
-| `entry` | `skip_same_side_position` | 同方向ポジションがある場合に新規エントリーをスキップするか |
+| `entry` | `skip_same_side_position`, `skip_same_side_across_strategies` | 同方向ポジションの重複をstrategy単位または全strategy横断でスキップするか |
+
+`trading_pause.windows` は `HH:MM` のJSTで指定する。時間帯に入っている間は `/webhook` は `reason: "trading_pause"` の skip レスポンスを返し、MT5注文を送らない。デフォルトでは entry / close の両方と Discord 通知を止める。`entry_only: true` にすると新規エントリーだけ止めて決済は通し、`notify_on_skip: true` にすると止めたエントリーの Discord 通知は送る。`start` が `end` より後の指定は日跨ぎとして扱う。
+
+`news_filter.enabled: true` の場合、Gaikaex の経済指標カレンダーを `refresh_seconds` ごとに取得し、`impact_filter` に一致する中・高重要度イベントの前後 `minutes_before` / `minutes_after` 分だけ entry を `reason: "news_filter"` でスキップする。対象通貨は USDJPY なら USD/JPY、XAUUSD や NASDAQ 系は USD として判定する。`notify_on_skip: true` なら、スキップ時も Discord embed にニュース理由を追加して通知する。取得失敗時はデフォルトでは発注を止めない。止めたい場合は `skip_on_fetch_error: true` にする。
 
 ## 起動方法
 
@@ -160,6 +166,8 @@ GUI でできること:
 - `TradingView Webhook URL`: TradingView に貼る URL を表示してコピー。`host=0.0.0.0` の場合は `<YOUR_PUBLIC_HOST>` を実際の公開ホストに置換
 - `Test` タブ: Webhook 疎通テストと MT5 テスト注文を実行
 - `MT5 Profiles` タブ: 追加MT5プロファイルを一覧から選択し、単一MT5設定と同じように端末選択・接続テスト。`Default Order Targets` で通常時の発注先を複数選択
+- `Trading Pause` タブ: 現在JSTを確認し、Entry Only / Notify Skipped Entry と停止時間を設定
+- `News Filter` タブ: 経済指標フィルタの有効化、前後停止分数、重要度、取得テスト、Test Symbol の現在停止判定を確認
 - `Send Webhook Test`: サーバー未起動なら現在設定で起動確認を出してから送信。`Dry Run` OFF の場合は実注文確認を出す
 - `Save Config`: 設定を `config.json` に保存
 - `Start/Stop`: Webhook サーバー制御
@@ -288,7 +296,7 @@ Wemof Strategy Original (20, 3, 100, 10, 200, 200, 5,000, 20, 5, 1.1): {{ticker}
 Gate Breaker T-L: {{ticker}} で {{strategy.order.action}} @ {{strategy.order.contracts}} の注文が約定しました。新しいストラテジーポジションは {{strategy.position_size}} です
 ```
 
-各 alert は MT5 order comment を `tv-bridge-r15` / `tv-bridge-r15a` / `tv-bridge-r30` / `tv-bridge-r30a` / `tv-bridge-rem` / `tv-bridge-wem` / `tv-bridge-gbtl` に分けます。`entry.skip_same_side_position` が `true` の場合も、この comment 単位で同方向ポジションを判定します。
+各 alert は MT5 order comment を `tv-bridge-r15` / `tv-bridge-r15a` / `tv-bridge-r30` / `tv-bridge-r30a` / `tv-bridge-rem` / `tv-bridge-wem` / `tv-bridge-gbtl` に分けます。`entry.skip_same_side_position` が `true` の場合は、この comment 単位で同方向ポジションを判定します。`entry.skip_same_side_across_strategies` が `true` の場合は comment に関係なく、同一MT5口座・シンボル・方向で1ポジに制限します。
 
 ## 運用
 

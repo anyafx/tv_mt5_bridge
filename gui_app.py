@@ -26,7 +26,32 @@ try:
 except Exception as exc:  # noqa: BLE001
     raise RuntimeError(f"tkinter is required for GUI mode: {exc}") from exc
 
-from bridge import AppConfig, DiscordConfig, LotManager, MT5Config, MT5Trader, RoutingConfig, SymbolResolver, build_discord_embed_payload, create_handler, discord_request_headers, mt5, normalize_profile_targets, normalize_symbol, select_mt5_profile_names
+from bridge import (
+    AppConfig,
+    DiscordConfig,
+    LotManager,
+    MT5Config,
+    MT5Trader,
+    Mt5WorkerPool,
+    NewsFilter,
+    NewsFilterConfig,
+    RoutingConfig,
+    SymbolResolver,
+    TradingPauseConfig,
+    TradingPauseWindow,
+    build_discord_embed_payload,
+    create_handler,
+    discord_request_headers,
+    fetch_economic_calendar_events,
+    jst_now,
+    mt5,
+    news_event_matches_impact,
+    normalize_profile_targets,
+    normalize_symbol,
+    parse_hhmm,
+    select_mt5_profile_names,
+    trading_pause_match,
+)
 
 
 class QueueLogHandler(logging.Handler):
@@ -312,7 +337,8 @@ class BridgeService:
         self._lock = threading.Lock()
         self._server: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
-        self._trader: MT5Trader | None = None
+        self._worker_pool: Mt5WorkerPool | None = None
+        self._news_filter: NewsFilter | None = None
         self._config: AppConfig | None = None
 
     @property
@@ -331,10 +357,12 @@ class BridgeService:
             if self._thread is not None and self._thread.is_alive():
                 raise RuntimeError("Server is already running")
 
-            trader = MT5Trader(config.mt5, config.dry_run, self.logger)
+            worker_pool = Mt5WorkerPool(config, self.logger)
+            worker_pool.start_all()
             resolver = SymbolResolver(config.symbols, self.logger)
-            lot_manager = LotManager(config.risk)
-            handler = create_handler(config, trader, resolver, lot_manager, self.logger)
+            news_filter = NewsFilter(config.news_filter, self.logger)
+            news_filter.start()
+            handler = create_handler(config, worker_pool, resolver, news_filter, self.logger)
             server = ThreadingHTTPServer((config.webhook.host, config.webhook.port), handler)
 
             def _run() -> None:
@@ -346,25 +374,29 @@ class BridgeService:
                     self.logger.exception("Server loop error: %s", exc)
                 finally:
                     server.server_close()
-                    trader.shutdown()
+                    worker_pool.stop()
+                    news_filter.stop()
                     self.logger.info("Webhook server stopped")
 
             thread = threading.Thread(target=_run, name="tv-mt5-webhook", daemon=True)
             thread.start()
 
             self._config = config
-            self._trader = trader
+            self._worker_pool = worker_pool
             self._server = server
             self._thread = thread
+            self._news_filter = news_filter
 
     def stop(self) -> None:
         with self._lock:
             server = self._server
             thread = self._thread
-            trader = self._trader
+            worker_pool = self._worker_pool
+            news_filter = self._news_filter
             self._server = None
             self._thread = None
-            self._trader = None
+            self._worker_pool = None
+            self._news_filter = None
 
         if server:
             try:
@@ -377,8 +409,10 @@ class BridgeService:
                 pass
         if thread:
             thread.join(timeout=5)
-        if trader:
-            trader.shutdown()
+        if worker_pool:
+            worker_pool.stop()
+        if news_filter:
+            news_filter.stop()
 
 
 class BridgeGUI(tk.Tk):
@@ -393,6 +427,8 @@ class BridgeGUI(tk.Tk):
         self.mt5_profiles_ui: dict[str, dict[str, Any]] = {}
         self.profile_lots_ui: dict[str, float] = {}
         self.profile_symbol_lots_ui: dict[str, dict[str, float]] = {}
+        self.strategy_routing_ids: list[str] = []
+        self.strategy_routing_vars: dict[str, dict[str, tk.BooleanVar]] = {}
 
         self.log_queue: queue.Queue[str] = queue.Queue()
         self.log_handler = QueueLogHandler(self.log_queue)
@@ -403,6 +439,7 @@ class BridgeGUI(tk.Tk):
         self._build_layout()
         self._load_or_default()
         self._refresh_status()
+        self._refresh_jst_clock()
         self._drain_logs()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -422,10 +459,27 @@ class BridgeGUI(tk.Tk):
         self.var_webhook_url = tk.StringVar()
         self.var_dry_run = tk.BooleanVar(value=True)
         self.var_skip_same_side = tk.BooleanVar(value=True)
+        self.var_skip_same_side_across_strategies = tk.BooleanVar(value=False)
         self.var_discord_enabled = tk.BooleanVar(value=False)
         self.var_discord_webhook_url = tk.StringVar()
         self.var_discord_username = tk.StringVar(value="半裁量アラート")
         self.var_discord_avatar_url = tk.StringVar()
+        self.var_trading_pause_enabled = tk.BooleanVar(value=False)
+        self.var_trading_pause_entry_only = tk.BooleanVar(value=False)
+        self.var_trading_pause_notify_on_skip = tk.BooleanVar(value=False)
+        self.var_trading_pause_start = tk.StringVar()
+        self.var_trading_pause_stop = tk.StringVar()
+        self.var_trading_pause_label = tk.StringVar()
+        self.var_trading_pause_state = tk.StringVar(value="inactive")
+        self.var_news_filter_enabled = tk.BooleanVar(value=False)
+        self.var_news_source_url = tk.StringVar(value="https://www.gaikaex.com/gaikaex/mark/calendar/")
+        self.var_news_minutes_before = tk.StringVar(value="15")
+        self.var_news_minutes_after = tk.StringVar(value="15")
+        self.var_news_impact_filter = tk.StringVar(value="medium_high")
+        self.var_news_refresh_seconds = tk.StringVar(value="300")
+        self.var_news_notify_on_skip = tk.BooleanVar(value=True)
+        self.var_news_skip_on_fetch_error = tk.BooleanVar(value=False)
+        self.var_news_status = tk.StringVar(value="inactive")
 
         self.var_default_lot = tk.StringVar(value="0.1")
         self.var_test_symbol = tk.StringVar(value="USDJPY")
@@ -443,6 +497,7 @@ class BridgeGUI(tk.Tk):
         self.var_profile_fill_mode = tk.StringVar(value="auto")
         self.var_profile_lot = tk.StringVar()
         self.var_dedupe_same_terminal = tk.BooleanVar(value=True)
+        self.var_new_strategy_id = tk.StringVar()
         self.var_min_lot = tk.StringVar(value="0.01")
         self.var_max_lot = tk.StringVar(value="10.0")
         self.var_refresh = tk.StringVar(value="300")
@@ -450,6 +505,7 @@ class BridgeGUI(tk.Tk):
         self.var_prefixes = tk.StringVar(value="")
         self.var_suffixes = tk.StringVar(value=", .m, m, .pro, _pro, .ecn, -ecn, .cash")
         self.var_status = tk.StringVar(value="STOPPED")
+        self.var_jst_clock = tk.StringVar(value="")
         self.current_profile_name: str | None = None
 
         for var in (self.var_host, self.var_port, self.var_secret):
@@ -518,6 +574,11 @@ class BridgeGUI(tk.Tk):
         dry_frame.grid(row=12, column=1, sticky="w", padx=6, pady=4)
         ttk.Checkbutton(dry_frame, text="Dry Run", variable=self.var_dry_run).pack(side=tk.LEFT)
         ttk.Checkbutton(dry_frame, text="Skip Same-Side Position", variable=self.var_skip_same_side).pack(side=tk.LEFT, padx=(10, 0))
+        ttk.Checkbutton(
+            dry_frame,
+            text="Skip Same-Side Across Strategies",
+            variable=self.var_skip_same_side_across_strategies,
+        ).pack(side=tk.LEFT, padx=(10, 0))
         ttk.Label(top, text="Mode").grid(row=12, column=0, sticky="w", padx=6, pady=4)
 
         notebook = ttk.Notebook(body)
@@ -526,11 +587,15 @@ class BridgeGUI(tk.Tk):
         risk_tab = ttk.Frame(notebook)
         symbol_tab = ttk.Frame(notebook)
         route_tab = ttk.Frame(notebook)
+        pause_tab = ttk.Frame(notebook)
+        news_tab = ttk.Frame(notebook)
         discord_tab = ttk.Frame(notebook)
         logs_tab = ttk.Frame(notebook)
         notebook.add(risk_tab, text="Risk")
         notebook.add(symbol_tab, text="Symbols")
         notebook.add(route_tab, text="MT5 Profiles")
+        notebook.add(pause_tab, text="Trading Pause")
+        notebook.add(news_tab, text="News Filter")
         notebook.add(discord_tab, text="Discord")
         test_tab = ttk.Frame(notebook)
         notebook.add(test_tab, text="Test")
@@ -608,10 +673,121 @@ class BridgeGUI(tk.Tk):
         ttk.Label(route_tab, text="Default Order Targets").grid(row=2, column=0, sticky="nw", padx=6, pady=4)
         self.lst_default_targets = tk.Listbox(route_tab, height=4, selectmode=tk.MULTIPLE, exportselection=False)
         self.lst_default_targets.grid(row=2, column=1, sticky="ew", padx=6, pady=4)
-        ttk.Label(route_tab, text="Routing (JSON)").grid(row=3, column=0, sticky="nw", padx=6, pady=4)
-        self.txt_routing = scrolledtext.ScrolledText(route_tab, height=10)
+        ttk.Label(route_tab, text="Routing (JSON, symbol_profiles etc.)").grid(row=3, column=0, sticky="nw", padx=6, pady=4)
+        self.txt_routing = scrolledtext.ScrolledText(route_tab, height=8)
         self.txt_routing.grid(row=3, column=1, sticky="nsew", padx=6, pady=4)
         route_tab.rowconfigure(3, weight=1)
+
+        ttk.Label(route_tab, text="Strategy Routing (logic -> account)").grid(row=4, column=0, sticky="nw", padx=6, pady=(10, 4))
+        strategy_matrix_outer = ttk.Frame(route_tab)
+        strategy_matrix_outer.grid(row=4, column=1, sticky="nsew", padx=6, pady=(10, 4))
+        strategy_matrix_outer.columnconfigure(0, weight=1)
+        add_strategy_row = ttk.Frame(strategy_matrix_outer)
+        add_strategy_row.grid(row=0, column=0, sticky="w", pady=(0, 4))
+        ttk.Label(add_strategy_row, text="strategy_id").pack(side=tk.LEFT)
+        ttk.Entry(add_strategy_row, textvariable=self.var_new_strategy_id, width=24).pack(side=tk.LEFT, padx=(4, 6))
+        ttk.Button(add_strategy_row, text="Add", command=self._add_strategy_routing_row).pack(side=tk.LEFT)
+        ttk.Label(
+            strategy_matrix_outer,
+            text="チェックした口座にのみそのstrategy_idを送信します（未チェックの口座には送りません）。",
+            foreground="gray",
+        ).grid(row=1, column=0, sticky="w")
+        self.strategy_matrix_grid = ttk.Frame(strategy_matrix_outer)
+        self.strategy_matrix_grid.grid(row=2, column=0, sticky="nsew", pady=(4, 0))
+        route_tab.rowconfigure(4, weight=1)
+
+        pause_tab.columnconfigure(1, weight=1)
+        pause_tab.rowconfigure(4, weight=1)
+        pause_mode = ttk.Frame(pause_tab)
+        pause_mode.grid(
+            row=0,
+            column=1,
+            sticky="w",
+            padx=6,
+            pady=4,
+        )
+        ttk.Checkbutton(pause_mode, text="Enable Trading Pause", variable=self.var_trading_pause_enabled).pack(side=tk.LEFT)
+        ttk.Checkbutton(pause_mode, text="Entry Only", variable=self.var_trading_pause_entry_only).pack(side=tk.LEFT, padx=(10, 0))
+        ttk.Checkbutton(pause_mode, text="Notify Skipped Entry", variable=self.var_trading_pause_notify_on_skip).pack(side=tk.LEFT, padx=(10, 0))
+        ttk.Label(pause_tab, text="Mode").grid(row=0, column=0, sticky="w", padx=6, pady=4)
+        ttk.Label(pause_tab, textvariable=self.var_jst_clock).grid(row=1, column=1, sticky="w", padx=6, pady=4)
+        ttk.Label(pause_tab, text="Current JST").grid(row=1, column=0, sticky="w", padx=6, pady=4)
+        ttk.Label(pause_tab, textvariable=self.var_trading_pause_state).grid(row=2, column=1, sticky="w", padx=6, pady=4)
+        ttk.Label(pause_tab, text="Pause Status").grid(row=2, column=0, sticky="w", padx=6, pady=4)
+
+        pause_add = ttk.Frame(pause_tab)
+        pause_add.grid(row=3, column=1, sticky="ew", padx=6, pady=4)
+        pause_add.columnconfigure(1, weight=1)
+        pause_add.columnconfigure(3, weight=1)
+        pause_add.columnconfigure(5, weight=2)
+        ttk.Label(pause_add, text="Start").grid(row=0, column=0, sticky="w")
+        ttk.Entry(pause_add, textvariable=self.var_trading_pause_start, width=8).grid(row=0, column=1, sticky="w", padx=(4, 10))
+        ttk.Label(pause_add, text="Stop").grid(row=0, column=2, sticky="w")
+        ttk.Entry(pause_add, textvariable=self.var_trading_pause_stop, width=8).grid(row=0, column=3, sticky="w", padx=(4, 10))
+        ttk.Label(pause_add, text="Label").grid(row=0, column=4, sticky="w")
+        ttk.Entry(pause_add, textvariable=self.var_trading_pause_label).grid(row=0, column=5, sticky="ew", padx=(4, 10))
+        ttk.Button(pause_add, text="Add", command=self._add_trading_pause_window).grid(row=0, column=6, sticky="w")
+        ttk.Label(pause_tab, text="Add Window").grid(row=3, column=0, sticky="w", padx=6, pady=4)
+
+        ttk.Label(pause_tab, text="Pause Windows JST (JSON)").grid(row=4, column=0, sticky="nw", padx=6, pady=4)
+        self.txt_trading_pause_windows = scrolledtext.ScrolledText(pause_tab, height=10)
+        self.txt_trading_pause_windows.grid(row=4, column=1, sticky="nsew", padx=6, pady=4)
+        ttk.Label(
+            pause_tab,
+            text='Example: [{"start": "08:55", "end": "09:10", "label": "Tokyo open"}]',
+        ).grid(row=5, column=1, sticky="w", padx=6, pady=4)
+
+        news_tab.columnconfigure(1, weight=1)
+        news_tab.rowconfigure(8, weight=1)
+        news_mode = ttk.Frame(news_tab)
+        news_mode.grid(row=0, column=1, sticky="w", padx=6, pady=4)
+        ttk.Checkbutton(news_mode, text="Enable News Filter", variable=self.var_news_filter_enabled).pack(side=tk.LEFT)
+        ttk.Checkbutton(news_mode, text="Notify Skipped Entry", variable=self.var_news_notify_on_skip).pack(side=tk.LEFT, padx=(10, 0))
+        ttk.Checkbutton(news_mode, text="Skip On Fetch Error", variable=self.var_news_skip_on_fetch_error).pack(side=tk.LEFT, padx=(10, 0))
+        ttk.Label(news_tab, text="Mode").grid(row=0, column=0, sticky="w", padx=6, pady=4)
+        self._add_row(news_tab, 1, "Source URL", ttk.Entry(news_tab, textvariable=self.var_news_source_url))
+        news_window = ttk.Frame(news_tab)
+        news_window.grid(row=2, column=1, sticky="w", padx=6, pady=4)
+        ttk.Label(news_window, text="Before").pack(side=tk.LEFT)
+        ttk.Entry(news_window, textvariable=self.var_news_minutes_before, width=6).pack(side=tk.LEFT, padx=(4, 10))
+        ttk.Label(news_window, text="After").pack(side=tk.LEFT)
+        ttk.Entry(news_window, textvariable=self.var_news_minutes_after, width=6).pack(side=tk.LEFT, padx=(4, 10))
+        ttk.Label(news_window, text="minutes").pack(side=tk.LEFT)
+        ttk.Label(news_tab, text="Skip Window").grid(row=2, column=0, sticky="w", padx=6, pady=4)
+        self._add_row(
+            news_tab,
+            3,
+            "Impact Filter",
+            ttk.Combobox(
+                news_tab,
+                textvariable=self.var_news_impact_filter,
+                values=("medium_high", "high", "medium"),
+                state="readonly",
+            ),
+        )
+        self._add_row(news_tab, 4, "Refresh Seconds", ttk.Entry(news_tab, textvariable=self.var_news_refresh_seconds))
+        ttk.Label(news_tab, textvariable=self.var_news_status).grid(row=5, column=1, sticky="w", padx=6, pady=4)
+        ttk.Label(news_tab, text="Status").grid(row=5, column=0, sticky="w", padx=6, pady=4)
+        news_buttons = ttk.Frame(news_tab)
+        news_buttons.grid(row=6, column=1, sticky="w", padx=6, pady=8)
+        ttk.Button(news_buttons, text="Fetch News", command=self._fetch_news_events).pack(side=tk.LEFT)
+        ttk.Button(news_buttons, text="Check Test Symbol", command=self._check_news_filter_symbol).pack(side=tk.LEFT, padx=8)
+        ttk.Label(news_tab, text="Events").grid(row=8, column=0, sticky="nw", padx=6, pady=4)
+        news_table_frame = ttk.Frame(news_tab)
+        news_table_frame.grid(row=8, column=1, sticky="nsew", padx=6, pady=4)
+        news_table_frame.rowconfigure(0, weight=1)
+        news_table_frame.columnconfigure(0, weight=1)
+        columns = ("time", "currency", "country", "impact", "name", "forecast", "previous")
+        self.tree_news_events = ttk.Treeview(news_table_frame, columns=columns, show="headings", height=10)
+        widths = (70, 70, 120, 70, 300, 100, 100)
+        labels = ("Time", "Currency", "Country", "Impact", "Name", "Forecast", "Previous")
+        for col, width, label in zip(columns, widths, labels):
+            self.tree_news_events.heading(col, text=label)
+            self.tree_news_events.column(col, width=width, anchor="w")
+        self.tree_news_events.grid(row=0, column=0, sticky="nsew")
+        news_scrollbar = ttk.Scrollbar(news_table_frame, orient="vertical", command=self.tree_news_events.yview)
+        self.tree_news_events.configure(yscrollcommand=news_scrollbar.set)
+        news_scrollbar.grid(row=0, column=1, sticky="ns")
 
         discord_tab.columnconfigure(1, weight=1)
         ttk.Checkbutton(discord_tab, text="Enable Discord Notify", variable=self.var_discord_enabled).grid(
@@ -625,8 +801,14 @@ class BridgeGUI(tk.Tk):
         self._add_row(discord_tab, 1, "Discord Webhook URL", ttk.Entry(discord_tab, textvariable=self.var_discord_webhook_url, show="*"))
         self._add_row(discord_tab, 2, "Bot Name", ttk.Entry(discord_tab, textvariable=self.var_discord_username))
         self._add_row(discord_tab, 3, "Avatar URL", ttk.Entry(discord_tab, textvariable=self.var_discord_avatar_url))
+        ttk.Label(discord_tab, text="Rate Limit by strategy_id (JSON, seconds)").grid(
+            row=4, column=0, sticky="nw", padx=6, pady=4
+        )
+        self.txt_discord_rate_limit = scrolledtext.ScrolledText(discord_tab, height=6)
+        self.txt_discord_rate_limit.grid(row=4, column=1, sticky="nsew", padx=6, pady=4)
+        discord_tab.rowconfigure(4, weight=1)
         discord_buttons = ttk.Frame(discord_tab)
-        discord_buttons.grid(row=4, column=1, sticky="w", padx=6, pady=8)
+        discord_buttons.grid(row=5, column=1, sticky="w", padx=6, pady=8)
         ttk.Button(discord_buttons, text="Send Discord Test", command=self._send_discord_test).pack(side=tk.LEFT)
 
         test_tab.columnconfigure(1, weight=1)
@@ -684,9 +866,43 @@ class BridgeGUI(tk.Tk):
             raise ValueError(f"{field_name} must be a JSON object")
         return data
 
+    def _read_json_list_text(self, widget: scrolledtext.ScrolledText, field_name: str) -> list[Any]:
+        raw = widget.get("1.0", tk.END).strip()
+        if not raw:
+            return []
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"{field_name} JSON parse error: {exc}") from exc
+        if not isinstance(data, list):
+            raise ValueError(f"{field_name} must be a JSON array")
+        return data
+
     def _set_json_text(self, widget: scrolledtext.ScrolledText, value: dict[str, Any]) -> None:
         widget.delete("1.0", tk.END)
         widget.insert("1.0", json.dumps(value, ensure_ascii=False, indent=2))
+
+    def _set_json_list_text(self, widget: scrolledtext.ScrolledText, value: list[Any]) -> None:
+        widget.delete("1.0", tk.END)
+        widget.insert("1.0", json.dumps(value, ensure_ascii=False, indent=2))
+
+    def _add_trading_pause_window(self) -> None:
+        start = self.var_trading_pause_start.get().strip()
+        stop = self.var_trading_pause_stop.get().strip()
+        label = self.var_trading_pause_label.get().strip()
+        try:
+            parse_hhmm(start)
+            parse_hhmm(stop)
+            windows = self._read_json_list_text(self.txt_trading_pause_windows, "trading_pause.windows")
+            windows.append({"start": start, "end": stop, "label": label})
+            self._set_json_list_text(self.txt_trading_pause_windows, windows)
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror("Add Trading Pause", str(exc))
+            return
+        self.var_trading_pause_start.set("")
+        self.var_trading_pause_stop.set("")
+        self.var_trading_pause_label.set("")
+        self.logger.info("Trading pause window added: %s-%s %s", start, stop, label)
 
     def _profile_value(self, profile: dict[str, Any], key: str, default: Any = "") -> Any:
         value = profile.get(key)
@@ -756,6 +972,74 @@ class BridgeGUI(tk.Tk):
             idx = names.index(select_name)
             self.lst_mt5_profiles.selection_set(idx)
             self.lst_mt5_profiles.see(idx)
+        self._refresh_strategy_matrix()
+
+    def _strategy_matrix_profile_names(self) -> list[str]:
+        return ["default"] + sorted(self.mt5_profiles_ui.keys())
+
+    def _refresh_strategy_matrix(self) -> None:
+        if not hasattr(self, "strategy_matrix_grid"):
+            return
+        profile_names = self._strategy_matrix_profile_names()
+        for widget in self.strategy_matrix_grid.winfo_children():
+            widget.destroy()
+        ttk.Label(self.strategy_matrix_grid, text="strategy_id", font=("TkDefaultFont", 9, "bold")).grid(
+            row=0, column=0, sticky="w", padx=4, pady=2
+        )
+        for col, profile_name in enumerate(profile_names, start=1):
+            ttk.Label(self.strategy_matrix_grid, text=profile_name, font=("TkDefaultFont", 9, "bold")).grid(
+                row=0, column=col, padx=4, pady=2
+            )
+        for row, strategy_id in enumerate(self.strategy_routing_ids, start=1):
+            ttk.Label(self.strategy_matrix_grid, text=strategy_id).grid(row=row, column=0, sticky="w", padx=4, pady=2)
+            row_vars = self.strategy_routing_vars.setdefault(strategy_id, {})
+            for col, profile_name in enumerate(profile_names, start=1):
+                var = row_vars.get(profile_name)
+                if var is None:
+                    var = tk.BooleanVar(value=False)
+                    row_vars[profile_name] = var
+                ttk.Checkbutton(self.strategy_matrix_grid, variable=var).grid(row=row, column=col, padx=4, pady=2)
+            ttk.Button(
+                self.strategy_matrix_grid,
+                text="Delete",
+                command=lambda sid=strategy_id: self._delete_strategy_routing_row(sid),
+            ).grid(row=row, column=len(profile_names) + 1, padx=(10, 4), pady=2)
+
+    def _add_strategy_routing_row(self) -> None:
+        strategy_id = self.var_new_strategy_id.get().strip()
+        if not strategy_id:
+            return
+        if strategy_id not in self.strategy_routing_ids:
+            self.strategy_routing_ids.append(strategy_id)
+            self.strategy_routing_ids.sort()
+        self.var_new_strategy_id.set("")
+        self._refresh_strategy_matrix()
+
+    def _delete_strategy_routing_row(self, strategy_id: str) -> None:
+        if strategy_id in self.strategy_routing_ids:
+            self.strategy_routing_ids.remove(strategy_id)
+        self.strategy_routing_vars.pop(strategy_id, None)
+        self._refresh_strategy_matrix()
+
+    def _set_strategy_routing_from_config(self, strategy_profiles: dict[str, Any]) -> None:
+        self.strategy_routing_ids = sorted(str(k) for k in strategy_profiles.keys())
+        self.strategy_routing_vars = {}
+        for strategy_id, value in strategy_profiles.items():
+            targets = set(normalize_profile_targets(value))
+            row_vars: dict[str, tk.BooleanVar] = {}
+            for profile_name in self._strategy_matrix_profile_names():
+                row_vars[profile_name] = tk.BooleanVar(value=profile_name in targets)
+            self.strategy_routing_vars[str(strategy_id)] = row_vars
+        self._refresh_strategy_matrix()
+
+    def _get_strategy_routing_dict(self) -> dict[str, list[str]]:
+        result: dict[str, list[str]] = {}
+        for strategy_id in self.strategy_routing_ids:
+            row_vars = self.strategy_routing_vars.get(strategy_id, {})
+            checked = [name for name in self._strategy_matrix_profile_names() if row_vars.get(name) and row_vars[name].get()]
+            if checked:
+                result[strategy_id] = checked
+        return result
 
     def _get_default_target_selection(self) -> list[str]:
         if not hasattr(self, "lst_default_targets"):
@@ -921,10 +1205,28 @@ class BridgeGUI(tk.Tk):
         self.var_secret.set(cfg.webhook.secret)
         self.var_dry_run.set(cfg.dry_run)
         self.var_skip_same_side.set(cfg.entry.skip_same_side_position)
+        self.var_skip_same_side_across_strategies.set(cfg.entry.skip_same_side_across_strategies)
         self.var_discord_enabled.set(bool(cfg.discord.enabled))
         self.var_discord_webhook_url.set(cfg.discord.webhook_url)
         self.var_discord_username.set(cfg.discord.username)
         self.var_discord_avatar_url.set(cfg.discord.avatar_url)
+        self._set_json_text(self.txt_discord_rate_limit, cfg.discord.rate_limit_seconds)
+        self.var_trading_pause_enabled.set(bool(cfg.trading_pause.enabled))
+        self.var_trading_pause_entry_only.set(bool(cfg.trading_pause.entry_only))
+        self.var_trading_pause_notify_on_skip.set(bool(cfg.trading_pause.notify_on_skip))
+        self._set_json_list_text(
+            self.txt_trading_pause_windows,
+            [asdict(window) for window in cfg.trading_pause.windows],
+        )
+        self.var_news_filter_enabled.set(bool(cfg.news_filter.enabled))
+        self.var_news_source_url.set(cfg.news_filter.source_url)
+        self.var_news_minutes_before.set(str(cfg.news_filter.minutes_before))
+        self.var_news_minutes_after.set(str(cfg.news_filter.minutes_after))
+        self.var_news_impact_filter.set(cfg.news_filter.impact_filter)
+        self.var_news_refresh_seconds.set(str(cfg.news_filter.refresh_seconds))
+        self.var_news_notify_on_skip.set(bool(cfg.news_filter.notify_on_skip))
+        self.var_news_skip_on_fetch_error.set(bool(cfg.news_filter.skip_on_fetch_error))
+        self.var_news_status.set("inactive (disabled)" if not cfg.news_filter.enabled else "ready")
 
         self.var_default_lot.set(str(cfg.risk.default_lot))
         self.var_min_lot.set(str(cfg.risk.min_lot))
@@ -953,6 +1255,7 @@ class BridgeGUI(tk.Tk):
         self._set_json_text(self.txt_routing, asdict(cfg.routing))
         self.var_dedupe_same_terminal.set(bool(cfg.routing.dedupe_same_terminal))
         self._set_default_target_selection(cfg.routing.default_profile)
+        self._set_strategy_routing_from_config(cfg.routing.strategy_profiles)
         self._update_webhook_url()
 
     def _collect_config_from_ui(self) -> AppConfig:
@@ -960,6 +1263,7 @@ class BridgeGUI(tk.Tk):
         aliases = self._read_json_text(self.txt_aliases, "aliases")
         explicit_map = self._read_json_text(self.txt_explicit, "explicit_map")
         routing = self._read_json_text(self.txt_routing, "routing")
+        pause_windows_raw = self._read_json_list_text(self.txt_trading_pause_windows, "trading_pause.windows")
         if self.var_profile_name.get().strip():
             if not self._apply_profile_form(silent=True):
                 raise ValueError("MT5 profile form is invalid")
@@ -987,8 +1291,32 @@ class BridgeGUI(tk.Tk):
         cfg.discord.webhook_url = self.var_discord_webhook_url.get().strip()
         cfg.discord.username = self.var_discord_username.get().strip() or "半裁量アラート"
         cfg.discord.avatar_url = self.var_discord_avatar_url.get().strip()
+        discord_rate_limit = self._read_json_text(self.txt_discord_rate_limit, "discord.rate_limit_seconds")
+        cfg.discord.rate_limit_seconds = {str(k): int(v) for k, v in discord_rate_limit.items()}
+        cfg.trading_pause = TradingPauseConfig(
+            enabled=bool(self.var_trading_pause_enabled.get()),
+            timezone="Asia/Tokyo",
+            entry_only=bool(self.var_trading_pause_entry_only.get()),
+            notify_on_skip=bool(self.var_trading_pause_notify_on_skip.get()),
+            windows=[],
+        )
+        for window in pause_windows_raw:
+            if not isinstance(window, dict):
+                raise ValueError("trading_pause.windows items must be JSON objects")
+            cfg.trading_pause.windows.append(
+                TradingPauseWindow(
+                    start=str(window.get("start", "")).strip(),
+                    end=str(window.get("end", "")).strip(),
+                    label=str(window.get("label", "")).strip(),
+                )
+            )
+        for window in cfg.trading_pause.windows:
+            parse_hhmm(window.start)
+            parse_hhmm(window.end)
+        cfg.news_filter = self._news_filter_config_from_ui()
         cfg.dry_run = bool(self.var_dry_run.get())
         cfg.entry.skip_same_side_position = bool(self.var_skip_same_side.get())
+        cfg.entry.skip_same_side_across_strategies = bool(self.var_skip_same_side_across_strategies.get())
 
         cfg.risk.default_lot = float(self.var_default_lot.get().strip())
         cfg.risk.min_lot = float(self.var_min_lot.get().strip())
@@ -1015,7 +1343,7 @@ class BridgeGUI(tk.Tk):
         target_profiles = self._get_default_target_selection()
         cfg.routing.default_profile = target_profiles[0] if len(target_profiles) == 1 else (target_profiles or ["default"])
         cfg.routing.symbol_profiles = {normalize_symbol(str(k)): v for k, v in cfg.routing.symbol_profiles.items()}
-        cfg.routing.strategy_profiles = {str(k): v for k, v in cfg.routing.strategy_profiles.items()}
+        cfg.routing.strategy_profiles = self._get_strategy_routing_dict()
         return cfg
 
     def _save_config(self) -> None:
@@ -1101,6 +1429,115 @@ class BridgeGUI(tk.Tk):
             )
 
         self._run_worker("MT5 Test", _probe)
+
+    def _news_filter_config_from_ui(self) -> NewsFilterConfig:
+        minutes_before = int(self.var_news_minutes_before.get().strip() or "15")
+        minutes_after = int(self.var_news_minutes_after.get().strip() or "15")
+        refresh_seconds = int(self.var_news_refresh_seconds.get().strip() or "300")
+        impact_filter = self.var_news_impact_filter.get().strip() or "medium_high"
+        if minutes_before < 0 or minutes_after < 0:
+            raise ValueError("news_filter minutes_before/minutes_after must be 0 or greater")
+        if refresh_seconds < 60:
+            raise ValueError("news_filter refresh_seconds must be 60 or greater")
+        if impact_filter not in {"medium", "high", "medium_high"}:
+            raise ValueError("news_filter impact_filter must be medium, high, or medium_high")
+        return NewsFilterConfig(
+            enabled=bool(self.var_news_filter_enabled.get()),
+            source_url=self.var_news_source_url.get().strip() or "https://www.gaikaex.com/gaikaex/mark/calendar/",
+            timezone="Asia/Tokyo",
+            minutes_before=minutes_before,
+            minutes_after=minutes_after,
+            impact_filter=impact_filter,
+            refresh_seconds=refresh_seconds,
+            notify_on_skip=bool(self.var_news_notify_on_skip.get()),
+            skip_on_fetch_error=bool(self.var_news_skip_on_fetch_error.get()),
+        )
+
+    def _set_news_events(self, rows: list[tuple[str, str, str, str, str, str, str]]) -> None:
+        for item in self.tree_news_events.get_children():
+            self.tree_news_events.delete(item)
+        for row in rows:
+            self.tree_news_events.insert("", tk.END, values=row)
+
+    def _fetch_news_events(self) -> None:
+        try:
+            config = self._news_filter_config_from_ui()
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror("News Fetch", str(exc))
+            return
+
+        self.var_news_status.set("fetching...")
+
+        def _worker() -> None:
+            try:
+                now = jst_now()
+                events = [
+                    event for event in fetch_economic_calendar_events(config, now)
+                    if news_event_matches_impact(event, config.impact_filter)
+                ]
+                rows = [
+                    (
+                        event.time,
+                        event.currency,
+                        event.country,
+                        event.impact_label,
+                        event.name,
+                        event.forecast,
+                        event.previous,
+                    )
+                    for event in events
+                ]
+                status = f"fetched {len(events)} events at {now.strftime('%H:%M:%S JST')}"
+                self.after(0, lambda: self._set_news_events(rows))
+                self.after(0, lambda msg=status: self.var_news_status.set(msg))
+                self.logger.info("News filter fetch completed: %s events", len(events))
+            except Exception as exc:  # noqa: BLE001
+                error = str(exc)
+                self.after(0, lambda msg=error: self.var_news_status.set(f"fetch failed: {msg}"))
+                self.after(0, lambda msg=error: messagebox.showerror("News Fetch", msg))
+                self.logger.error("News filter fetch failed: %s", exc)
+
+        threading.Thread(target=_worker, name="tv-mt5-news-fetch", daemon=True).start()
+
+    def _check_news_filter_symbol(self) -> None:
+        try:
+            config = self._news_filter_config_from_ui()
+            symbol = self.var_test_symbol.get().strip() or "USDJPY"
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror("News Check", str(exc))
+            return
+
+        self.var_news_status.set("checking...")
+
+        def _worker() -> None:
+            try:
+                news_filter = NewsFilter(config, self.logger)
+                now = jst_now()
+                match = news_filter.match(symbol, now)
+                if not config.enabled:
+                    message = "News Filter is disabled."
+                elif match is None:
+                    message = f"{symbol} is not blocked now.\nchecked_at: {now.strftime('%Y-%m-%d %H:%M:%S JST')}"
+                else:
+                    event = match.event
+                    message = "\n".join(
+                        [
+                            f"{symbol} is blocked now.",
+                            f"event: {event.time} {event.country} {event.impact_label} {event.name}",
+                            f"currency: {event.currency}",
+                            f"window: {match.window_start.strftime('%H:%M')} - {match.window_end.strftime('%H:%M')} JST",
+                        ]
+                    )
+                self.after(0, lambda msg=message: self.var_news_status.set(msg.splitlines()[0]))
+                self.after(0, lambda msg=message: messagebox.showinfo("News Check", msg))
+                self.logger.info("News filter symbol check: %s", message.replace("\n", " / "))
+            except Exception as exc:  # noqa: BLE001
+                error = str(exc)
+                self.after(0, lambda msg=error: self.var_news_status.set(f"check failed: {msg}"))
+                self.after(0, lambda msg=error: messagebox.showerror("News Check", msg))
+                self.logger.error("News filter symbol check failed: %s", exc)
+
+        threading.Thread(target=_worker, name="tv-mt5-news-check", daemon=True).start()
 
     def _run_worker(self, title: str, fn: Any) -> None:
         def _worker() -> None:
@@ -1359,6 +1796,43 @@ class BridgeGUI(tk.Tk):
     def _refresh_status(self) -> None:
         self.var_status.set(self.service.status_text())
         self.after(500, self._refresh_status)
+
+    def _refresh_jst_clock(self) -> None:
+        self.var_jst_clock.set(jst_now().strftime("%Y-%m-%d %H:%M:%S JST"))
+        self.var_trading_pause_state.set(self._trading_pause_state_text())
+        self.after(1000, self._refresh_jst_clock)
+
+    def _trading_pause_state_text(self) -> str:
+        if not self.var_trading_pause_enabled.get():
+            return "inactive (disabled)"
+        try:
+            windows = self._read_json_list_text(self.txt_trading_pause_windows, "trading_pause.windows")
+            pause_config = TradingPauseConfig(
+                enabled=True,
+                timezone="Asia/Tokyo",
+                entry_only=bool(self.var_trading_pause_entry_only.get()),
+                notify_on_skip=bool(self.var_trading_pause_notify_on_skip.get()),
+                windows=[],
+            )
+            for window in windows:
+                if not isinstance(window, dict):
+                    return "invalid config: window must be an object"
+                pause_config.windows.append(
+                    TradingPauseWindow(
+                        start=str(window.get("start", "")).strip(),
+                        end=str(window.get("end", "")).strip(),
+                        label=str(window.get("label", "")).strip(),
+                    )
+                )
+            active_window = trading_pause_match(pause_config)
+        except Exception as exc:  # noqa: BLE001
+            return f"invalid config: {exc}"
+        if active_window is None:
+            return "inactive"
+        label = f" ({active_window.label})" if active_window.label else ""
+        scope = "entry only" if self.var_trading_pause_entry_only.get() else "all orders"
+        notify = ", notify" if self.var_trading_pause_notify_on_skip.get() else ""
+        return f"ACTIVE {active_window.start}-{active_window.end}{label} [{scope}{notify}]"
 
     def _drain_logs(self) -> None:
         lines: list[str] = []

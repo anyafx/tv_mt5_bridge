@@ -29,6 +29,8 @@ TradingView -> MT5 Bridge の主要コンポーネント、設定、Webhook 処�
 | `routing` | strategy / symbol / default の順で発注先 profile を選ぶ |
 | `webhook` | bind host、port、shared secret |
 | `discord` | 約定 alert の Discord 通知設定 |
+| `trading_pause` | JST時間帯による注文停止設定。必要に応じて entry のみ停止、停止中通知を選べる |
+| `news_filter` | 経済指標カレンダーによる entry 停止設定 |
 | `symbols` | alias、明示 map、prefix/suffix 探索、refresh 間隔 |
 | `risk` | default lot、symbol/profile 別 lot、min/max lot |
 | `entry` | 同方向ポジション重複エントリーの抑止 |
@@ -42,11 +44,13 @@ TradingView -> MT5 Bridge の主要コンポーネント、設定、Webhook 処�
 3. `webhook.secret` が設定されている場合、payload、query、`X-Webhook-Secret` のいずれかと照合する。
 4. strategy fill alert が決済・縮小と判断された場合は `strategy_fill_not_entry` で skip する。
 5. `parse_action` と `parse_symbol_list` で action と対象 symbol を決める。
-6. `SymbolResolver.canonicalize` で canonical symbol を決め、`routing` または payload 指定から発注先 profile を選ぶ。
-7. profile ごとに `SymbolResolver.resolve` で MT5 実シンボルを決める。
-8. entry の場合、必要に応じて同方向ポジションを確認し、ロットを決め、`MT5Trader.market_order` を呼ぶ。
-9. close の場合、`MT5Trader.close_positions` を呼ぶ。
-10. 銘柄・profile ごとの結果を `results[]` に積んで JSON で返す。
+6. `trading_pause` のJST時間帯に入っている場合は `trading_pause` で skip する。`entry_only: true` なら close は通し、`notify_on_skip: true` なら停止した entry の Discord 通知は送る。
+7. `news_filter` が有効で関連通貨の重要指標前後に入っている場合は、entry を `news_filter` で skip する。close は止めない。
+8. `SymbolResolver.canonicalize` で canonical symbol を決め、`routing` または payload 指定から発注先 profile を選ぶ。
+9. profile ごとに `SymbolResolver.resolve` で MT5 実シンボルを決める。
+10. entry の場合、必要に応じて同方向ポジションを確認し、ロットを決め、`MT5Trader.market_order` を呼ぶ。
+11. close の場合、`MT5Trader.close_positions` を呼ぶ。
+12. 銘柄・profile ごとの結果を `results[]` に積んで JSON で返す。
 
 ## strategy fill alert
 
@@ -58,7 +62,8 @@ TradingView strategy fill alert は専用の正規表現で解析される。対
 - TP、SL、決済、縮小は別 EA に任せる。
 - `entry_only: true` のため、SL / TP は発注 request に入れない。
 - `skip_scope: strategy` の場合、重複判定は MT5 comment suffix 単位で行う。
-- 同一 strategy のほぼ同時 alert は一時 lock file で短時間抑止する。
+- `skip_same_side_across_strategies` が有効な場合は `skip_scope: strategy` より優先し、同一シンボル・方向を全strategy横断で判定する。
+- `skip_same_side_position` が有効な通常Webhookと同一 strategy のほぼ同時 alert は、一時 lock file で短時間抑止する。
 
 ## MT5 発注フロー
 

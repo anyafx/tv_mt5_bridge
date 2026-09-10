@@ -385,17 +385,75 @@ USDJPY 15 統合サイン↑ 150.123
 
 HTTP status は `400`。
 
+### 玉暴威アラートの確定フィルタ
+
+メッセージが `【予告】` `【候補】` `【確定】` `【取消】` `【包足】` のいずれかのタグで始まる場合（玉暴威インジケーターのアラート形式）、`【確定】` 以外は発注せずにスキップする。`【候補】` `【取消】` は本文に `BUY` / `SELL` を含むことがあるが、自然文推定の対象にはしない。
+
+- `【確定】` のみ、通常どおり `BUY` / `SELL` から action を推定して発注する。symbol は `XAUUSD` 固定（本文にシンボル情報が含まれないため）
+- それ以外のタグは `symbol` / `action` を推定せず、常に skip する
+
+スキップ時のレスポンス例:
+
+```json
+{
+  "ok": true,
+  "results": [
+    {
+      "skipped": true,
+      "reason": "tama_bakui_not_confirmed",
+      "tama_bakui_tag": "候補"
+    }
+  ]
+}
+```
+
 ## エントリー処理
+
+`trading_pause.enabled` が `true` で現在時刻が `trading_pause.windows` のいずれかに入っている場合、MT5注文を送らず `trading_pause` で skip する。時間は `Asia/Tokyo` の `HH:MM` で判定し、日跨ぎの時間帯も扱う。
+
+デフォルトでは entry / close の両方と Discord 通知を止める。`trading_pause.entry_only: true` の場合は entry だけ止め、close は通常処理する。`trading_pause.notify_on_skip: true` の場合は、止めた entry でも Discord 通知を送る。
+
+`news_filter.enabled` が `true` の場合、Gaikaex 経済指標カレンダーから当日の中・高重要度指標を取得し、対象symbolの関連通貨が指標前後 `minutes_before` / `minutes_after` 分に入っている entry を `news_filter` で skip する。close は止めない。`notify_on_skip: true` の場合は、止めた entry でも Discord 通知を送り、embed内にニュース理由を追加する。
+
+停止時間中のskipレスポンス例:
+
+```json
+{
+  "ok": true,
+  "results": [
+    {
+      "skipped": true,
+      "reason": "trading_pause",
+      "symbol": "USDJPY",
+      "action": "buy",
+      "side": "buy",
+      "pause_scope": "entry",
+      "discord_notify_requested": true,
+      "pause_window": {
+        "start": "08:55",
+        "end": "09:10",
+        "label": "Tokyo open",
+        "timezone": "Asia/Tokyo"
+      }
+    }
+  ]
+}
+```
 
 `action` が entry の場合:
 
 1. シンボルを解決する
-2. `entry.skip_same_side_position` が `true` なら、MT5 の既存ポジション数を取得する
+2. `entry.skip_same_side_position` または `entry.skip_same_side_across_strategies` が `true` なら、MT5 の既存ポジション数を取得する
 3. 同方向ポジションがあれば `same_side_position_exists` で skip
-4. ロットを解決する
-5. `market_order` で成行注文を送る
+4. MT5 のポジション反映前に同方向のWebhookが重なった場合は、pending lock により `duplicate_entry_pending` で skip
+5. ロットを解決する
+6. `market_order` で成行注文を送る
 
 strategy fill 形式では `skip_scope: strategy` が設定されるため、既存ポジション判定は同じ `strategy_id` の MT5 comment suffix を対象にする。たとえば `tv-bridge-r30a` と `tv-bridge-1-r30a` は同じ 30m active として扱う。同じ銘柄・同じ方向でも、15m / 15m active / 30m / 30m active / REM default / Wemof / Gate Breaker T-L は独立して発注できる。
+
+`entry.skip_same_side_across_strategies` が `true` の場合は `skip_scope: strategy` より優先し、MT5 commentに関係なく同一MT5口座・`resolved_symbol`・方向の既存ポジションを数える。この設定は単独で有効になり、`entry.skip_same_side_position` が `false` でも全strategy横断の重複をスキップする。
+
+全strategy横断モードまたは `entry.skip_same_side_position` が `true` の通常Webhookでは、pending lock は同一MT5口座・`resolved_symbol`・方向単位で取得する。strategy fill 形式では、全strategy横断モードがOFFなら同一strategy単位、ONならシンボル・方向単位で取得する。成功した注文のlockは10秒間保持し、MT5のpositions反映前に届く重複Webhookを抑止する。
 
 strategy fill 形式で決済・縮小と判断した場合の skip レスポンス例:
 
@@ -426,6 +484,37 @@ skip レスポンス例:
   "reason": "same_side_position_exists",
   "side": "buy",
   "existing_positions": {"buy": 1, "sell": 0, "total": 1}
+}
+```
+
+ニュース停止中のskipレスポンス例:
+
+```json
+{
+  "ok": true,
+  "results": [
+    {
+      "skipped": true,
+      "reason": "news_filter",
+      "symbol": "USDJPY",
+      "canonical_symbol": "USDJPY",
+      "action": "buy",
+      "side": "buy",
+      "discord_notify_requested": true,
+      "news_event": {
+        "time": "21:30",
+        "country": "米国",
+        "currency": "USD",
+        "impact": "高",
+        "name": "雇用統計"
+      },
+      "news_window": {
+        "minutes_before": 15,
+        "minutes_after": 15,
+        "timezone": "Asia/Tokyo"
+      }
+    }
+  ]
 }
 ```
 

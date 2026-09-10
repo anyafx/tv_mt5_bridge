@@ -3,16 +3,22 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import html
 import json
 import logging
+import logging.handlers
+import multiprocessing
 import os
+import queue
 import random
 import re
 import tempfile
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
+from html.parser import HTMLParser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -23,6 +29,14 @@ try:
     import MetaTrader5 as mt5
 except ImportError:
     mt5 = None
+
+try:
+    import requests
+    from bs4 import BeautifulSoup, Tag
+except ImportError:
+    requests = None
+    BeautifulSoup = None
+    Tag = None
 
 
 def normalize_symbol(value: str) -> str:
@@ -52,6 +66,34 @@ def to_optional_float(value: Any) -> float | None:
 
 STRATEGY_COMMENT_MAX_LEN = 31
 PENDING_ENTRY_SECONDS = 10
+GAIKAEX_CALENDAR_URL = "https://www.gaikaex.com/gaikaex/mark/calendar/"
+GAIKAEX_REQUEST_TIMEOUT = 20
+ECONOMIC_CALENDAR_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/126.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
+}
+MAJOR_NEWS_COUNTRIES = [
+    "米国",
+    "日本",
+    "ユーロ",
+    "ドイツ",
+    "フランス",
+    "スペイン",
+    "イタリア",
+    "英国",
+    "イギリス",
+    "オーストラリア",
+    "豪",
+    "ニュージーランド",
+    "NZ",
+    "カナダ",
+    "スイス",
+]
+CURRENCY_CODES = {"USD", "JPY", "EUR", "GBP", "AUD", "NZD", "CAD", "CHF"}
 STRATEGY_ALERT_PROFILES = {
     "rem_bb_pullback_15m": {"label": "15m", "comment": "r15"},
     "rem_bb_pullback_15m_active": {"label": "15m_active", "comment": "r15a"},
@@ -70,6 +112,10 @@ DISCORD_STRATEGY_LABELS = {
     "wemof_original": "Wemof",
     "gate_breaker_tl": "Gate Breaker T-L",
 }
+TAMA_BAKUI_ENTRY_TAG = "確定"
+TAMA_BAKUI_TAGS = {"予告", "候補", "確定", "取消", "包足"}
+TAMA_BAKUI_DEFAULT_SYMBOL = "XAUUSD"
+TAMA_BAKUI_DISCORD_LABEL = "1mスキャ"
 TIPS_LIST = [
     "🌸 上位足の方向には逆らわないのがコツだよ！",
     "✨ 損切りは『次のチャンスへの入場料』、怖くないよ。",
@@ -160,17 +206,28 @@ def strategy_comment_suffix(strategy_id: str | None) -> str | None:
     return f"-{suffix}"
 
 
-def pending_entry_key(config: "MT5Config", symbol: str, side: str, strategy_id: str | None) -> str | None:
-    suffix = strategy_comment_suffix(strategy_id)
-    if not suffix:
+def same_side_scope_strategy_id(
+    strategy_id: str | None,
+    skip_scope: str,
+    across_strategies: bool,
+) -> str | None:
+    if across_strategies:
         return None
+    if strategy_id and skip_scope == "strategy":
+        return strategy_id
+    return None
+
+
+def pending_entry_key(config: "MT5Config", symbol: str, side: str, strategy_id: str | None) -> str:
+    suffix = strategy_comment_suffix(strategy_id)
+    scope = suffix or "all-strategies"
     parts = [
         str(config.terminal_path or "").strip().lower(),
         "" if config.login is None else str(config.login),
         str(config.server or "").strip().lower(),
         normalize_symbol(symbol),
         side.lower(),
-        suffix,
+        scope,
     ]
     raw = "\0".join(parts)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
@@ -300,6 +357,7 @@ class DiscordConfig:
     webhook_url: str = ""
     username: str = "半裁量アラート"
     avatar_url: str = ""
+    rate_limit_seconds: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass
@@ -324,6 +382,76 @@ class RiskConfig:
 @dataclass
 class EntryConfig:
     skip_same_side_position: bool = True
+    skip_same_side_across_strategies: bool = False
+
+
+@dataclass
+class TradingPauseWindow:
+    start: str
+    end: str
+    label: str = ""
+
+
+@dataclass
+class TradingPauseConfig:
+    enabled: bool = False
+    timezone: str = "Asia/Tokyo"
+    entry_only: bool = False
+    notify_on_skip: bool = False
+    windows: list[TradingPauseWindow] = field(default_factory=list)
+
+
+@dataclass
+class NewsFilterConfig:
+    enabled: bool = False
+    source_url: str = GAIKAEX_CALENDAR_URL
+    timezone: str = "Asia/Tokyo"
+    minutes_before: int = 15
+    minutes_after: int = 15
+    impact_filter: str = "medium_high"
+    refresh_seconds: int = 300
+    notify_on_skip: bool = True
+    skip_on_fetch_error: bool = False
+
+
+@dataclass(frozen=True)
+class EconomicCalendarEvent:
+    event_date: str
+    time: str
+    country: str
+    currency: str
+    impact: int
+    name: str
+    forecast: str = "-"
+    actual: str = "-"
+    previous: str = "-"
+
+    @property
+    def impact_label(self) -> str:
+        return "高" if self.impact >= 3 else "中"
+
+    @property
+    def event_datetime(self) -> datetime | None:
+        if self.time == "--:--":
+            return None
+        try:
+            hour, minute = [int(part) for part in self.time.split(":", 1)]
+            year, month, day = [int(part) for part in self.event_date.split("-", 2)]
+        except ValueError:
+            return None
+        day_offset, normalized_hour = divmod(hour, 24)
+        return datetime(year, month, day, normalized_hour, minute, tzinfo=JST) + timedelta(days=day_offset)
+
+    def to_discord_line(self) -> str:
+        return f"{self.time} {self.country} {self.impact_label} - {self.name}"
+
+
+@dataclass(frozen=True)
+class NewsFilterMatch:
+    event: EconomicCalendarEvent
+    window_start: datetime
+    window_end: datetime
+    symbol_currencies: list[str]
 
 
 @dataclass
@@ -341,6 +469,8 @@ class AppConfig:
     routing: RoutingConfig = field(default_factory=RoutingConfig)
     webhook: WebhookConfig = field(default_factory=WebhookConfig)
     discord: DiscordConfig = field(default_factory=DiscordConfig)
+    trading_pause: TradingPauseConfig = field(default_factory=TradingPauseConfig)
+    news_filter: NewsFilterConfig = field(default_factory=NewsFilterConfig)
     symbols: SymbolConfig = field(default_factory=SymbolConfig)
     risk: RiskConfig = field(default_factory=RiskConfig)
     entry: EntryConfig = field(default_factory=EntryConfig)
@@ -360,6 +490,42 @@ class AppConfig:
         routing_cfg.strategy_profiles = {str(k): v for k, v in routing_cfg.strategy_profiles.items()}
         webhook_cfg = WebhookConfig(**raw.get("webhook", {}))
         discord_cfg = DiscordConfig(**raw.get("discord", {}))
+        pause_raw = raw.get("trading_pause", {})
+        pause_windows = [
+            TradingPauseWindow(
+                start=str(window.get("start", "")),
+                end=str(window.get("end", "")),
+                label=str(window.get("label", "")),
+            )
+            for window in pause_raw.get("windows", [])
+            if isinstance(window, dict)
+        ]
+        trading_pause_cfg = TradingPauseConfig(
+            enabled=bool(pause_raw.get("enabled", False)),
+            timezone=str(pause_raw.get("timezone", "Asia/Tokyo") or "Asia/Tokyo"),
+            entry_only=bool(pause_raw.get("entry_only", False)),
+            notify_on_skip=bool(pause_raw.get("notify_on_skip", False)),
+            windows=pause_windows,
+        )
+        for window in trading_pause_cfg.windows:
+            parse_hhmm(window.start)
+            parse_hhmm(window.end)
+        news_raw = raw.get("news_filter", {})
+        news_filter_cfg = NewsFilterConfig(
+            enabled=bool(news_raw.get("enabled", False)),
+            source_url=str(news_raw.get("source_url", GAIKAEX_CALENDAR_URL) or GAIKAEX_CALENDAR_URL),
+            timezone=str(news_raw.get("timezone", "Asia/Tokyo") or "Asia/Tokyo"),
+            minutes_before=max(0, int(news_raw.get("minutes_before", 15))),
+            minutes_after=max(0, int(news_raw.get("minutes_after", 15))),
+            impact_filter=str(news_raw.get("impact_filter", "medium_high") or "medium_high"),
+            refresh_seconds=max(60, int(news_raw.get("refresh_seconds", 300))),
+            notify_on_skip=bool(news_raw.get("notify_on_skip", True)),
+            skip_on_fetch_error=bool(news_raw.get("skip_on_fetch_error", False)),
+        )
+        if news_filter_cfg.timezone not in {"Asia/Tokyo", "JST"}:
+            raise ValueError("news_filter.timezone currently supports only Asia/Tokyo or JST")
+        if news_filter_cfg.impact_filter not in {"medium", "high", "medium_high"}:
+            raise ValueError("news_filter.impact_filter must be medium, high, or medium_high")
         symbols_cfg = SymbolConfig(**raw.get("symbols", {}))
         risk_cfg = RiskConfig(**raw.get("risk", {}))
         entry_cfg = EntryConfig(**raw.get("entry", {}))
@@ -369,6 +535,8 @@ class AppConfig:
             routing=routing_cfg,
             webhook=webhook_cfg,
             discord=discord_cfg,
+            trading_pause=trading_pause_cfg,
+            news_filter=news_filter_cfg,
             symbols=symbols_cfg,
             risk=risk_cfg,
             entry=entry_cfg,
@@ -418,14 +586,24 @@ def parse_plain_text_payload(text: str) -> dict[str, Any]:
     if strategy_payload:
         return strategy_payload
 
+    tama_bakui_match = re.match(r"^【(?P<tag>[^】]+)】", message)
+    if tama_bakui_match and tama_bakui_match.group("tag") in TAMA_BAKUI_TAGS:
+        tag = tama_bakui_match.group("tag")
+        out["tama_bakui_tag"] = tag
+        if tag != TAMA_BAKUI_ENTRY_TAG:
+            out["tama_bakui_skip"] = True
+            return out
+        out["symbol"] = TAMA_BAKUI_DEFAULT_SYMBOL
+        out["strategy_label"] = TAMA_BAKUI_DISCORD_LABEL
+
     upper = message.upper()
     if re.search(r"\bBUY\b", upper) or "統合サイン↑" in message:
         out["action"] = "buy"
     elif re.search(r"\bSELL\b", upper) or "統合サイン↓" in message:
         out["action"] = "sell"
 
-    match_exchange = re.search(r"\b[A-Z0-9_]+:([A-Z0-9._/-]{2,20})\b", upper)
-    if match_exchange:
+    match_exchange = re.search(r"\b[A-Z][A-Z0-9_]*:([A-Z][A-Z0-9._/-]{1,19})\b", upper)
+    if match_exchange and "symbol" not in out:
         out["symbol"] = match_exchange.group(1)
     elif "symbol" not in out:
         tokens = re.findall(r"\b[A-Z][A-Z0-9._/-]{2,20}\b", upper)
@@ -576,14 +754,406 @@ class SymbolResolver:
         best_score = -1
         for avail_name, avail_norm in self._symbols_norm.items():
             for candidate in candidates:
-                score = self._score(avail_norm, normalize_symbol(candidate))
+                candidate_norm = normalize_symbol(candidate)
+                if len(candidate_norm) < 3:
+                    # Too short to fuzzy-match safely (e.g. stray digits from a
+                    # misparsed alert can otherwise substring-match into an
+                    # unrelated real symbol like "24" -> "XAUUSD247r").
+                    continue
+                score = self._score(avail_norm, candidate_norm)
                 if score > best_score or (score == best_score and avail_name < best_name):
                     best_score = score
                     best_name = avail_name
 
         if best_name and best_score > 0:
+            self.logger.warning(
+                "Symbol resolved via fuzzy match: raw=%s canonical=%s -> %s (score=%s)",
+                raw,
+                canonical,
+                best_name,
+                best_score,
+            )
             return best_name, canonical
         return raw, canonical
+
+
+def clean_html_text(value: str) -> str:
+    return " ".join(html.unescape(re.sub(r"<[^>]+>", " ", value)).replace("\xa0", " ").split())
+
+
+def country_to_currency(country: str) -> str:
+    if "米" in country:
+        return "USD"
+    if "日本" in country:
+        return "JPY"
+    if any(name in country for name in ["ユーロ", "ドイツ", "フランス", "スペイン", "イタリア"]):
+        return "EUR"
+    if "英国" in country or "イギリス" in country:
+        return "GBP"
+    if "オーストラリア" in country or "豪" in country:
+        return "AUD"
+    if "ニュージーランド" in country or "NZ" in country:
+        return "NZD"
+    if "カナダ" in country:
+        return "CAD"
+    if "スイス" in country:
+        return "CHF"
+    return ""
+
+
+def is_major_news_country(country: str) -> bool:
+    return any(name in country for name in MAJOR_NEWS_COUNTRIES)
+
+
+def news_event_matches_impact(event: EconomicCalendarEvent, impact_filter: str) -> bool:
+    if impact_filter == "high":
+        return event.impact >= 3
+    if impact_filter == "medium":
+        return event.impact == 2
+    return event.impact >= 2
+
+
+def format_md(date_value: date) -> str:
+    return f"{date_value.month}/{date_value.day}"
+
+
+def iso_date(date_value: date) -> str:
+    return date_value.strftime("%Y-%m-%d")
+
+
+class CalendarListParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=False)
+        self.items: list[tuple[list[str], str]] = []
+        self._capture_depth = 0
+        self._current_classes: list[str] = []
+        self._parts: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        classes = str(dict(attrs).get("class") or "").split()
+        if tag.lower() == "li" and ("date_title" in classes or "data_box" in classes) and self._capture_depth == 0:
+            self._current_classes = classes
+            self._parts = [self.get_starttag_text() or ""]
+            self._capture_depth = 1
+            return
+        if self._capture_depth:
+            self._capture_depth += 1
+            self._parts.append(self.get_starttag_text() or "")
+
+    def handle_endtag(self, tag: str) -> None:
+        if not self._capture_depth:
+            return
+        self._parts.append(f"</{tag}>")
+        self._capture_depth -= 1
+        if self._capture_depth == 0:
+            self.items.append((self._current_classes, "".join(self._parts)))
+            self._current_classes = []
+            self._parts = []
+
+    def handle_data(self, data: str) -> None:
+        if self._capture_depth:
+            self._parts.append(data)
+
+    def handle_entityref(self, name: str) -> None:
+        if self._capture_depth:
+            self._parts.append(f"&{name};")
+
+    def handle_charref(self, name: str) -> None:
+        if self._capture_depth:
+            self._parts.append(f"&#{name};")
+
+
+def first_class_text(block_html: str, class_name: str) -> str:
+    match = re.search(
+        rf"<(?P<tag>[a-zA-Z0-9]+)[^>]*class=[\"'][^\"']*\b{re.escape(class_name)}\b[^\"']*[\"'][^>]*>(?P<body>.*?)</(?P=tag)>",
+        block_html,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    return clean_html_text(match.group("body")) if match else ""
+
+
+def extract_status_value(block_html: str, label: str) -> str:
+    match = re.search(
+        rf"<span[^>]*class=[\"'][^\"']*\bstatus\b[^\"']*[\"'][^>]*>\s*{re.escape(label)}\s*</span>(?P<body>.*?)(?:</p>|</li>|<span)",
+        block_html,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if not match:
+        return "-"
+    text = clean_html_text(match.group("body"))
+    return text or "-"
+
+
+def bs4_clean_text(value: str) -> str:
+    return " ".join(html.unescape(value).replace("\xa0", " ").split())
+
+
+def bs4_first_text(select_result: Any) -> str:
+    if not select_result:
+        return ""
+    return bs4_clean_text(select_result[0].get_text(" ", strip=True))
+
+
+def bs4_extract_status_value(container: Any, label: str) -> str:
+    if Tag is None:
+        return "-"
+    for span in container.select("span.status"):
+        if bs4_clean_text(span.get_text()) != label:
+            continue
+        parent = span.parent
+        if not isinstance(parent, Tag):
+            continue
+        text = bs4_clean_text(parent.get_text(" ", strip=True))
+        if text.startswith(label):
+            text = text[len(label):].strip()
+        return text or "-"
+    return "-"
+
+
+def bs4_get_day_blocks(calendar_html: str) -> list[tuple[str, str]]:
+    if BeautifulSoup is None or Tag is None:
+        return []
+    soup = BeautifulSoup(calendar_html, "html.parser")
+    blocks: list[tuple[str, str]] = []
+    for date_title in soup.select("li.date_title"):
+        label = bs4_clean_text(date_title.get_text())
+        parts = [str(date_title)]
+        for sibling in date_title.next_siblings:
+            if isinstance(sibling, Tag) and "date_title" in sibling.get("class", []):
+                break
+            parts.append(str(sibling))
+        blocks.append((label, "".join(parts)))
+    return blocks
+
+
+def bs4_extract_day_block(calendar_html: str, date_label: str) -> str:
+    for label, block in bs4_get_day_blocks(calendar_html):
+        if label.startswith(f"{date_label}（") or label.startswith(f"{date_label}("):
+            return block
+    return ""
+
+
+def bs4_parse_events_from_block(block_html: str, event_date: str) -> list[EconomicCalendarEvent]:
+    if not block_html or BeautifulSoup is None:
+        return []
+    soup = BeautifulSoup(block_html, "html.parser")
+    events: list[EconomicCalendarEvent] = []
+
+    for box in soup.select("li.data_box"):
+        country = bs4_first_text(box.select("p.flag"))
+        time_value = ""
+        for p_tag in box.find_all("p", recursive=True):
+            text = bs4_clean_text(p_tag.get_text(" ", strip=True))
+            if text == "--:--" or len(text) == 5 and text[2] == ":" and text[:2].isdigit() and text[3:].isdigit():
+                time_value = text
+                break
+
+        impact = 0
+        for p_tag in box.find_all("p", recursive=True):
+            text = bs4_clean_text(p_tag.get_text("", strip=True))
+            if "重要度" in text:
+                impact = text.count("★")
+                break
+
+        name = bs4_first_text(box.select("p.index_name"))
+        forecast = bs4_extract_status_value(box, "予想")
+        actual = bs4_extract_status_value(box, "結果")
+        previous = bs4_extract_status_value(box, "前回")
+
+        if not country or not name or impact < 2 or not is_major_news_country(country):
+            continue
+
+        events.append(
+            EconomicCalendarEvent(
+                event_date=event_date,
+                time=time_value or "--:--",
+                country=country,
+                currency=country_to_currency(country),
+                impact=impact,
+                name=name,
+                forecast=forecast,
+                actual=actual,
+                previous=previous,
+            )
+        )
+    return events
+
+
+def parse_calendar_events_from_html_bs4(calendar_html: str, now: datetime) -> list[EconomicCalendarEvent]:
+    if now.weekday() >= 5:
+        return []
+    today_label = format_md(now.date())
+    today_iso = iso_date(now.date())
+    today_block = bs4_extract_day_block(calendar_html, today_label)
+    return bs4_parse_events_from_block(today_block, today_iso)
+
+
+def parse_calendar_events_from_html(calendar_html: str, now: datetime) -> list[EconomicCalendarEvent]:
+    parser = CalendarListParser()
+    parser.feed(calendar_html)
+
+    today_label = format_md(now.date())
+    today_iso = iso_date(now.date())
+    in_today = False
+    events: list[EconomicCalendarEvent] = []
+    for classes, item_html in parser.items:
+        if "date_title" in classes:
+            label = clean_html_text(item_html)
+            in_today = label.startswith(f"{today_label}（") or label.startswith(f"{today_label}(")
+            continue
+        if not in_today or "data_box" not in classes:
+            continue
+
+        country = first_class_text(item_html, "flag")
+        name = first_class_text(item_html, "index_name")
+        text = clean_html_text(item_html)
+        time_match = re.search(r"(?:^|\s)(--:--|\d{1,2}:\d{2})(?:\s|$)", text)
+        time_value = time_match.group(1) if time_match else "--:--"
+        impact = 0
+        importance_match = re.search(r"重要度\s*([★☆]+)", text)
+        if importance_match:
+            impact = importance_match.group(1).count("★")
+        elif "重要度" in text:
+            impact = text.count("★")
+
+        if not country or not name or impact < 2 or not is_major_news_country(country):
+            continue
+
+        events.append(
+            EconomicCalendarEvent(
+                event_date=today_iso,
+                time=time_value,
+                country=country,
+                currency=country_to_currency(country),
+                impact=impact,
+                name=name,
+                forecast=extract_status_value(item_html, "予想"),
+                actual=extract_status_value(item_html, "結果"),
+                previous=extract_status_value(item_html, "前回"),
+            )
+        )
+    return events
+
+
+def fetch_economic_calendar_events(config: NewsFilterConfig, now: datetime) -> list[EconomicCalendarEvent]:
+    if requests is not None and BeautifulSoup is not None:
+        response = requests.get(config.source_url, headers=ECONOMIC_CALENDAR_HEADERS, timeout=GAIKAEX_REQUEST_TIMEOUT)
+        response.raise_for_status()
+        response.encoding = response.encoding or "utf-8"
+        return parse_calendar_events_from_html_bs4(response.text, now)
+
+    req = request.Request(config.source_url, headers=ECONOMIC_CALENDAR_HEADERS)
+    with request.urlopen(req, timeout=GAIKAEX_REQUEST_TIMEOUT) as response:
+        raw = response.read()
+        charset = response.headers.get_content_charset() or "utf-8"
+    return parse_calendar_events_from_html(raw.decode(charset, errors="replace"), now)
+
+
+def symbol_currency_codes(symbol: str) -> list[str]:
+    normalized = normalize_symbol(symbol)
+    codes = [code for code in CURRENCY_CODES if code in normalized]
+    if "XAU" in normalized or "GOLD" in normalized:
+        codes.append("USD")
+    if any(token in normalized for token in ["NASDAQ", "NAS100", "US100", "USTEC", "US30", "SPX", "SP500"]):
+        codes.append("USD")
+
+    deduped: list[str] = []
+    for code in codes:
+        if code not in deduped:
+            deduped.append(code)
+    return deduped
+
+
+class NewsFilter:
+    def __init__(self, config: NewsFilterConfig, logger: logging.Logger) -> None:
+        self.config = config
+        self.logger = logger
+        self._events: list[EconomicCalendarEvent] = []
+        self._last_refresh = 0.0
+        self._last_error: str | None = None
+        self._lock = threading.Lock()
+        self._refresh_thread: threading.Thread | None = None
+        self._stop_event = threading.Event()
+
+    def start(self) -> None:
+        """Warm the cache and start background refresh so match() never blocks on network I/O."""
+        if not self.config.enabled or self._refresh_thread is not None:
+            return
+        try:
+            self._refresh_events(jst_now())
+        except Exception:  # noqa: BLE001
+            pass  # logged inside _refresh_events; background loop will keep retrying
+        self._stop_event.clear()
+        self._refresh_thread = threading.Thread(
+            target=self._refresh_loop, name="news-filter-refresh", daemon=True
+        )
+        self._refresh_thread.start()
+
+    def stop(self) -> None:
+        thread = self._refresh_thread
+        self._refresh_thread = None
+        self._stop_event.set()
+        if thread:
+            thread.join(timeout=5)
+
+    def _refresh_loop(self) -> None:
+        while not self._stop_event.wait(self.config.refresh_seconds):
+            try:
+                self._refresh_events(jst_now())
+            except Exception:  # noqa: BLE001
+                pass  # logged inside _refresh_events; keep looping and retry next interval
+
+    def _refresh_events(self, now: datetime) -> list[EconomicCalendarEvent]:
+        with self._lock:
+            current = time.time()
+            if self._events and current - self._last_refresh < self.config.refresh_seconds:
+                return self._events
+            try:
+                events = fetch_economic_calendar_events(self.config, now)
+                self._events = [
+                    event for event in events if news_event_matches_impact(event, self.config.impact_filter)
+                ]
+                self._last_refresh = current
+                self._last_error = None
+                self.logger.info("Economic calendar refreshed: %s events", len(self._events))
+            except Exception as exc:  # noqa: BLE001
+                self._last_error = str(exc)
+                self._last_refresh = current
+                self.logger.warning("Economic calendar refresh failed: %s", exc)
+                if self.config.skip_on_fetch_error:
+                    raise
+            return self._events
+
+    def match(self, symbol: str, now: datetime | None = None) -> NewsFilterMatch | None:
+        if not self.config.enabled:
+            return None
+        current = (now or jst_now()).astimezone(JST)
+        currencies = symbol_currency_codes(symbol)
+        if not currencies:
+            return None
+
+        if self._refresh_thread is not None:
+            # Background refresh is running: never block the caller on network I/O.
+            if self.config.skip_on_fetch_error and self._last_error is not None:
+                raise RuntimeError(f"Economic calendar fetch failing: {self._last_error}")
+            events = self._events
+        else:
+            events = self._refresh_events(current)
+
+        for event in events:
+            event_dt = event.event_datetime
+            if event_dt is None or not event.currency or event.currency not in currencies:
+                continue
+            window_start = event_dt - timedelta(minutes=self.config.minutes_before)
+            window_end = event_dt + timedelta(minutes=self.config.minutes_after)
+            if window_start <= current <= window_end:
+                return NewsFilterMatch(
+                    event=event,
+                    window_start=window_start,
+                    window_end=window_end,
+                    symbol_currencies=currencies,
+                )
+        return None
 
 
 class LotManager:
@@ -619,6 +1189,19 @@ class LotManager:
 
     def _clamp(self, lot: float) -> float:
         return max(self.config.min_lot, min(self.config.max_lot, lot))
+
+
+def _sanitize_mt5_result(value: Any) -> Any:
+    """Recursively converts MetaTrader5 named-tuple-like objects (e.g. the nested
+    TradeRequest inside OrderSendResult) into plain dicts, so results stay both
+    JSON-safe for the HTTP response and pickle-safe for the worker-process queue."""
+    if hasattr(value, "_asdict"):
+        return {k: _sanitize_mt5_result(v) for k, v in value._asdict().items()}
+    if isinstance(value, dict):
+        return {k: _sanitize_mt5_result(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_sanitize_mt5_result(v) for v in value]
+    return value
 
 
 class MT5Trader:
@@ -660,7 +1243,13 @@ class MT5Trader:
         if mt5 is None:
             raise RuntimeError("MetaTrader5 package is not installed. Run: pip install MetaTrader5")
         if self._connected:
-            return
+            # Long-lived worker processes hold this connection open across many
+            # requests, so a stale/dropped IPC link (terminal restart, network
+            # blip) has to be detected here rather than assumed from the flag.
+            if mt5.terminal_info() is not None:
+                return
+            self._connected = False
+            self.logger.warning("MT5 connection looked stale (terminal_info() failed); reconnecting")
 
         ok = mt5.initialize(path=self.config.terminal_path) if self.config.terminal_path else mt5.initialize()
         if not ok:
@@ -742,6 +1331,7 @@ class MT5Trader:
                 attempts.append({"type_filling": filling_mode, "error": str(mt5.last_error())})
                 continue
             as_dict = result._asdict() if hasattr(result, "_asdict") else {"retcode": getattr(result, "retcode", None)}
+            as_dict = _sanitize_mt5_result(as_dict)
             as_dict["type_filling"] = filling_mode
             retcode = int(as_dict.get("retcode") or 0)
             if retcode not in unsupported_fill:
@@ -912,6 +1502,274 @@ class MT5Trader:
             return out
 
 
+def _execute_symbol_profile_action(
+    trader: "MT5Trader",
+    resolver: "SymbolResolver",
+    lot_manager: "LotManager",
+    entry_config: "EntryConfig",
+    dry_run: bool,
+    profile_name: str,
+    profile_cfg: "MT5Config",
+    kwargs: dict[str, Any],
+) -> dict[str, Any]:
+    """Runs the full entry/close decision logic for one (symbol, profile) pair.
+
+    Executed inside that profile's dedicated worker process so it shares the
+    same live MT5 connection/symbol cache that trader/resolver hold.
+    """
+    raw_symbol = kwargs["raw_symbol"]
+    action_kind = kwargs["action_kind"]
+    action_side = kwargs["action_side"]
+    strategy_id = kwargs["strategy_id"]
+    strategy_label = kwargs["strategy_label"]
+    skip_scope = kwargs["skip_scope"]
+    sl = kwargs["sl"]
+    tp = kwargs["tp"]
+    lot_override = kwargs["lot_override"]
+
+    with trader._lock:
+        if mt5 is not None:
+            trader.connect()
+        resolved_symbol, canonical = resolver.resolve(raw_symbol)
+
+        if action_kind != "entry":
+            close_results = trader.close_positions(symbol=resolved_symbol, side_filter=action_side)
+            return {
+                "raw_symbol": raw_symbol,
+                "canonical_symbol": canonical,
+                "resolved_symbol": resolved_symbol,
+                "mt5_profile": profile_name,
+                "closed": len(close_results),
+                "result": close_results,
+            }
+
+        side = action_side or "buy"
+        counts = {"buy": 0, "sell": 0, "total": 0}
+        skip_across_strategies = entry_config.skip_same_side_across_strategies
+        same_side_skip_enabled = entry_config.skip_same_side_position or skip_across_strategies
+        counts_strategy_id = same_side_scope_strategy_id(strategy_id, skip_scope, skip_across_strategies)
+        if same_side_skip_enabled:
+            counts = trader.get_position_counts(resolved_symbol, strategy_id=counts_strategy_id)
+            same_count = counts["buy"] if side in {"buy", "long"} else counts["sell"]
+            if same_count > 0:
+                item = {
+                    "raw_symbol": raw_symbol,
+                    "canonical_symbol": canonical,
+                    "resolved_symbol": resolved_symbol,
+                    "mt5_profile": profile_name,
+                    "skipped": True,
+                    "reason": "same_side_position_exists",
+                    "side": side,
+                    "existing_positions": counts,
+                }
+                if strategy_id:
+                    item["strategy_id"] = strategy_id
+                    item["strategy_label"] = strategy_label
+                item["position_scope"] = "strategy" if counts_strategy_id else "symbol"
+                return item
+
+        lot = lot_manager.resolve_lot(canonical, lot_override, profile_name)
+        pending_marker: Path | None = None
+        pending_strategy_id = same_side_scope_strategy_id(strategy_id, skip_scope, skip_across_strategies)
+        use_pending_lock = not dry_run and (same_side_skip_enabled or pending_strategy_id is not None)
+        if use_pending_lock:
+            pending_marker = acquire_pending_entry(profile_cfg, resolved_symbol, side, pending_strategy_id)
+            if pending_marker is None:
+                item = {
+                    "raw_symbol": raw_symbol,
+                    "canonical_symbol": canonical,
+                    "resolved_symbol": resolved_symbol,
+                    "mt5_profile": profile_name,
+                    "skipped": True,
+                    "reason": "duplicate_entry_pending",
+                    "side": side,
+                    "existing_positions": counts,
+                    "position_scope": "strategy" if pending_strategy_id else "symbol",
+                }
+                if strategy_id:
+                    item["strategy_id"] = strategy_id
+                    item["strategy_label"] = strategy_label
+                return item
+
+        try:
+            result = trader.market_order(
+                symbol=resolved_symbol,
+                side=side,
+                lot=lot,
+                sl=to_optional_float(sl),
+                tp=to_optional_float(tp),
+                strategy_id=strategy_id,
+            )
+        except Exception:
+            release_pending_entry(pending_marker)
+            raise
+        retcode = int(result.get("retcode") or 0) if isinstance(result, dict) else 0
+        if pending_marker is not None and retcode not in {10008, 10009}:
+            release_pending_entry(pending_marker)
+        item = {
+            "raw_symbol": raw_symbol,
+            "canonical_symbol": canonical,
+            "resolved_symbol": resolved_symbol,
+            "mt5_profile": profile_name,
+            "lot": lot,
+            "existing_positions": counts,
+            "result": result,
+        }
+        if strategy_id:
+            item["strategy_id"] = strategy_id
+            item["strategy_label"] = strategy_label
+            item["position_scope"] = "strategy"
+        return item
+
+
+def _mt5_worker_main(
+    app_config: "AppConfig",
+    profile_name: str,
+    request_queue: Any,
+    log_queue: Any,
+) -> None:
+    worker_logger = logging.getLogger(f"tv-mt5-bridge.worker.{profile_name}")
+    worker_logger.setLevel(logging.INFO)
+    worker_logger.handlers = [logging.handlers.QueueHandler(log_queue)]
+    worker_logger.propagate = False
+
+    _, profile_cfg = app_config.mt5_profile_config(profile_name)
+    trader = MT5Trader(profile_cfg, app_config.dry_run, worker_logger)
+    resolver = SymbolResolver(app_config.symbols, worker_logger)
+    lot_manager = LotManager(app_config.risk)
+
+    if mt5 is not None:
+        try:
+            trader.connect()
+        except Exception as exc:  # noqa: BLE001
+            worker_logger.warning(
+                "MT5 worker initial connect failed, will retry on first order: %s", exc
+            )
+
+    try:
+        while True:
+            item = request_queue.get()
+            if item is None:
+                break
+            op, kwargs, response_queue = item
+            try:
+                if op != "handle_action":
+                    raise ValueError(f"Unknown MT5 worker op: {op}")
+                result = _execute_symbol_profile_action(
+                    trader,
+                    resolver,
+                    lot_manager,
+                    app_config.entry,
+                    app_config.dry_run,
+                    profile_name,
+                    profile_cfg,
+                    kwargs,
+                )
+                response_queue.put(("ok", result))
+            except Exception as exc:  # noqa: BLE001
+                worker_logger.warning("MT5 worker action failed: %s", exc)
+                response_queue.put(("error", str(exc)))
+    finally:
+        trader.shutdown()
+
+
+def _pump_worker_logs(log_queue: Any, logger: logging.Logger, stop_event: threading.Event) -> None:
+    while not stop_event.is_set():
+        try:
+            record = log_queue.get(timeout=0.5)
+        except queue.Empty:
+            continue
+        if record is None:
+            continue
+        logger.handle(record)
+
+
+class Mt5WorkerPool:
+    """One persistent process per MT5 profile so accounts place orders in parallel
+    with a warm connection, instead of reconnecting/logging in on every webhook."""
+
+    def __init__(self, app_config: "AppConfig", logger: logging.Logger) -> None:
+        self.app_config = app_config
+        self.logger = logger
+        self._ctx = multiprocessing.get_context("spawn")
+        # Response queues are created per-request, after the worker is already
+        # running, so they must be Manager proxies: a plain ctx.Queue() can only
+        # cross into a spawned child as part of that child's initial Process(args=...).
+        self._manager = self._ctx.Manager()
+        self._lock = threading.Lock()
+        self._processes: dict[str, Any] = {}
+        self._request_queues: dict[str, Any] = {}
+        self._log_queue = self._ctx.Queue()
+        self._log_stop_event = threading.Event()
+        self._log_thread = threading.Thread(
+            target=_pump_worker_logs,
+            args=(self._log_queue, self.logger, self._log_stop_event),
+            name="mt5-worker-log-pump",
+            daemon=True,
+        )
+        self._log_thread.start()
+
+    def start_all(self) -> None:
+        """Spawn workers for profiles actually reachable via routing config, so those
+        accounts are already connected before their first order. Profiles that exist
+        in mt5_profiles but aren't routed to anything stay untouched until (if ever)
+        a webhook explicitly targets them by name."""
+        targets = normalize_profile_targets(self.app_config.routing.default_profile) or ["default"]
+        for value in self.app_config.routing.symbol_profiles.values():
+            targets.extend(normalize_profile_targets(value))
+        for value in self.app_config.routing.strategy_profiles.values():
+            targets.extend(normalize_profile_targets(value))
+
+        for profile_name in expand_profile_targets(self.app_config, targets):
+            self._ensure_worker(profile_name)
+
+    def _ensure_worker(self, profile_name: str) -> Any:
+        with self._lock:
+            proc = self._processes.get(profile_name)
+            if proc is not None and proc.is_alive():
+                return self._request_queues[profile_name]
+            request_queue = self._ctx.Queue()
+            proc = self._ctx.Process(
+                target=_mt5_worker_main,
+                args=(self.app_config, profile_name, request_queue, self._log_queue),
+                name=f"mt5-worker-{profile_name}",
+                daemon=True,
+            )
+            proc.start()
+            self._processes[profile_name] = proc
+            self._request_queues[profile_name] = request_queue
+            self.logger.info("MT5 worker started: profile=%s pid=%s", profile_name, proc.pid)
+            return request_queue
+
+    def submit(self, profile_name: str, op: str, kwargs: dict[str, Any], timeout: float = 30.0) -> Any:
+        request_queue = self._ensure_worker(profile_name)
+        response_queue = self._manager.Queue()
+        request_queue.put((op, kwargs, response_queue))
+        status, payload = response_queue.get(timeout=timeout)
+        if status == "error":
+            raise RuntimeError(payload)
+        return payload
+
+    def stop(self) -> None:
+        with self._lock:
+            processes = list(self._processes.items())
+            queues = self._request_queues
+            self._processes = {}
+            self._request_queues = {}
+        for profile_name, _ in processes:
+            queue_for_profile = queues.get(profile_name)
+            if queue_for_profile is not None:
+                queue_for_profile.put(None)
+        for profile_name, proc in processes:
+            proc.join(timeout=5)
+            if proc.is_alive():
+                self.logger.warning("MT5 worker did not stop in time: profile=%s pid=%s", profile_name, proc.pid)
+                proc.terminate()
+        self._log_stop_event.set()
+        self._log_thread.join(timeout=2)
+        self._manager.shutdown()
+
+
 def parse_action(payload: dict[str, Any]) -> tuple[str, str | None]:
     raw = normalize_action(payload.get("action") or payload.get("side") or "")
     if raw in {"buy", "long"}:
@@ -1036,14 +1894,23 @@ def build_discord_embed_payload(
     now = jst_now()
     now_label = now.strftime("今日 %H:%M JST")
     color = 0x2ECC71 if side.lower() in {"buy", "long"} else 0xE74C3C
+    skip_reason = str(payload.get("discord_skip_reason") or "").strip()
+    skip_message = str(payload.get("discord_skip_message") or "").strip()
+    skip_title = str(payload.get("discord_skip_title") or "").strip() or {
+        "trading_pause": "🌙 流動性が低い時間だよ！気をつけてね",
+        "same_side_position_exists": "🚨 複数ポジションがある場合はエントリーは慎重に",
+        "news_filter": "🗓 指標前後1時間だよ！気をつけてね！",
+    }.get(skip_reason, "")
+    if skip_reason:
+        color = 0xF1C40F
 
-    description = "\n".join(
-        [
-            f"Tips: {tip}",
-            "",
-            f"**※必ずご自身でもチャートを確認してください。 | {now_label}**",
-        ]
-    )
+    description_lines = [f"Tips: {tip}"]
+    if skip_title:
+        description_lines.extend(["", f"**{skip_title}**"])
+    if skip_message:
+        description_lines.append(skip_message)
+    description_lines.extend(["", f"**※必ずご自身でもチャートを確認してください。 | {now_label}**"])
+    description = "\n".join(description_lines)
     message: dict[str, Any] = {
         "content": f"[{symbol}] {side_label} {side_emoji} ※{strategy}\n@everyone",
         "allowed_mentions": {"parse": ["everyone"]},
@@ -1079,6 +1946,39 @@ def jst_now() -> datetime:
     return datetime.now(JST)
 
 
+def parse_hhmm(value: str) -> int:
+    match = re.fullmatch(r"(\d{1,2}):(\d{2})", value.strip())
+    if not match:
+        raise ValueError(f"Invalid trading pause time: {value!r}. Use HH:MM.")
+    hour = int(match.group(1))
+    minute = int(match.group(2))
+    if hour > 23 or minute > 59:
+        raise ValueError(f"Invalid trading pause time: {value!r}. Use 00:00-23:59.")
+    return hour * 60 + minute
+
+
+def trading_pause_match(config: TradingPauseConfig, now: datetime | None = None) -> TradingPauseWindow | None:
+    if not config.enabled:
+        return None
+    if config.timezone not in {"Asia/Tokyo", "JST"}:
+        raise ValueError("trading_pause.timezone currently supports only Asia/Tokyo or JST")
+
+    current = now.astimezone(JST) if now else jst_now()
+    current_minutes = current.hour * 60 + current.minute
+    for window in config.windows:
+        start_minutes = parse_hhmm(window.start)
+        end_minutes = parse_hhmm(window.end)
+        if start_minutes == end_minutes:
+            continue
+        if start_minutes < end_minutes:
+            in_window = start_minutes <= current_minutes < end_minutes
+        else:
+            in_window = current_minutes >= start_minutes or current_minutes < end_minutes
+        if in_window:
+            return window
+    return None
+
+
 def discord_retry_delay(exc: Exception, fallback_delay: int) -> float:
     if not isinstance(exc, error.HTTPError) or exc.code != 429:
         return float(fallback_delay)
@@ -1112,6 +2012,27 @@ def post_discord_webhook(webhook_url: str, body: bytes) -> None:
         res.read()
 
 
+_discord_rate_limit_lock = threading.Lock()
+_discord_rate_limit_last_sent: dict[str, float] = {}
+
+
+def discord_rate_limited(config: DiscordConfig, strategy_id: str | None) -> bool:
+    """True if a notification for this strategy_id was already sent within its
+    configured cooldown window, so this one should be dropped (not queued)."""
+    if not strategy_id:
+        return False
+    window = config.rate_limit_seconds.get(strategy_id)
+    if not window or window <= 0:
+        return False
+    now = time.time()
+    with _discord_rate_limit_lock:
+        last_sent = _discord_rate_limit_last_sent.get(strategy_id, 0.0)
+        if now - last_sent < window:
+            return True
+        _discord_rate_limit_last_sent[strategy_id] = now
+        return False
+
+
 def send_discord_alert(
     config: DiscordConfig,
     symbol: str,
@@ -1120,6 +2041,16 @@ def send_discord_alert(
     logger: logging.Logger,
 ) -> None:
     if not config.enabled or not config.webhook_url.strip():
+        return
+
+    strategy_id = str(payload.get("strategy_id") or "").strip() or None
+    if discord_rate_limited(config, strategy_id):
+        logger.info(
+            "Discord alert rate-limited: strategy_id=%s symbol=%s side=%s",
+            strategy_id,
+            symbol,
+            side.upper(),
+        )
         return
 
     message = build_discord_embed_payload(config, symbol, side, payload)
@@ -1149,11 +2080,48 @@ def send_discord_alert(
             time.sleep(delay)
 
 
+def with_discord_skip_context(
+    payload: dict[str, Any],
+    reason: str,
+    message: str,
+    title: str | None = None,
+) -> dict[str, Any]:
+    out = dict(payload)
+    out["discord_skip_reason"] = reason
+    out["discord_skip_message"] = message
+    if title:
+        out["discord_skip_title"] = title
+    return out
+
+
+def duration_minutes_label(minutes: int) -> str:
+    if minutes > 0 and minutes % 60 == 0:
+        return f"{minutes // 60}時間"
+    return f"{minutes}分"
+
+
+def news_filter_discord_title(config: NewsFilterConfig) -> str:
+    if config.minutes_before == config.minutes_after:
+        return f"🗓 指標前後{duration_minutes_label(config.minutes_before)}だよ！気をつけてね！"
+    return (
+        f"🗓 指標{duration_minutes_label(config.minutes_before)}前/"
+        f"{duration_minutes_label(config.minutes_after)}後だよ！気をつけてね！"
+    )
+
+
+def news_skip_message(match: NewsFilterMatch) -> str:
+    event = match.event
+    return (
+        f"📰 {event.to_discord_line()}\n"
+        f"⏰ 警戒時間: {match.window_start.strftime('%H:%M')} - {match.window_end.strftime('%H:%M')} JST"
+    )
+
+
 def create_handler(
     app_config: AppConfig,
-    trader: MT5Trader,
+    worker_pool: Mt5WorkerPool,
     resolver: SymbolResolver,
-    lot_manager: LotManager,
+    news_filter: NewsFilter,
     logger: logging.Logger,
 ) -> type[BaseHTTPRequestHandler]:
     class WebhookHandler(BaseHTTPRequestHandler):
@@ -1241,6 +2209,22 @@ def create_handler(
                 return
 
             try:
+                if payload.get("tama_bakui_skip"):
+                    self._respond(
+                        200,
+                        {
+                            "ok": True,
+                            "results": [
+                                {
+                                    "skipped": True,
+                                    "reason": "tama_bakui_not_confirmed",
+                                    "tama_bakui_tag": payload.get("tama_bakui_tag"),
+                                }
+                            ],
+                        },
+                    )
+                    return
+
                 if payload.get("entry_only") and not payload.get("strategy_entry_signal", False):
                     self._respond(
                         200,
@@ -1266,126 +2250,199 @@ def create_handler(
                 if not symbols:
                     raise ValueError("Missing symbol/symbols field")
 
+                pause_window = trading_pause_match(app_config.trading_pause)
+                pause_skips_action = pause_window is not None and (
+                    not app_config.trading_pause.entry_only or action_kind == "entry"
+                )
+                if pause_window is not None and pause_skips_action:
+                    side = action_side or ""
+                    now = jst_now()
+                    logger.info(
+                        "Webhook skipped by trading pause: window=%s-%s label=%s entry_only=%s notify_on_skip=%s action=%s side=%s symbols=%s now=%s",
+                        pause_window.start,
+                        pause_window.end,
+                        pause_window.label or "",
+                        app_config.trading_pause.entry_only,
+                        app_config.trading_pause.notify_on_skip,
+                        action_kind,
+                        side,
+                        ",".join(symbols),
+                        now.strftime("%Y-%m-%d %H:%M JST"),
+                    )
+                    notify_requested = bool(app_config.trading_pause.notify_on_skip and action_kind == "entry")
+                    if notify_requested:
+                        notify_side = action_side or "buy"
+                        for raw_symbol in symbols:
+                            message = f"⏰ {pause_window.start} - {pause_window.end} JST"
+                            if pause_window.label:
+                                message = f"{message}\n📌 {pause_window.label}"
+                            notify_payload = with_discord_skip_context(payload, "trading_pause", message)
+                            discord_thread = threading.Thread(
+                                target=send_discord_alert,
+                                args=(app_config.discord, resolver.canonicalize(raw_symbol), notify_side, notify_payload, logger),
+                                name="tv-mt5-discord-alert",
+                                daemon=True,
+                            )
+                            discord_thread.start()
+                    self._respond(
+                        200,
+                        {
+                            "ok": True,
+                            "results": [
+                                {
+                                    "skipped": True,
+                                    "reason": "trading_pause",
+                                    "symbol": raw_symbol,
+                                    "action": payload.get("action"),
+                                    "side": side,
+                                    "pause_scope": "entry" if app_config.trading_pause.entry_only else "all",
+                                    "discord_notify_requested": notify_requested,
+                                    "pause_window": {
+                                        "start": pause_window.start,
+                                        "end": pause_window.end,
+                                        "label": pause_window.label,
+                                        "timezone": "Asia/Tokyo",
+                                    },
+                                    "now": now.isoformat(),
+                                }
+                                for raw_symbol in symbols
+                            ],
+                        },
+                    )
+                    return
+
+                pre_results: list[dict[str, Any]] = []
+                if action_kind == "entry" and app_config.news_filter.enabled:
+                    side = action_side or "buy"
+                    news_results: list[dict[str, Any]] = []
+                    skipped_news_symbols: set[str] = set()
+                    now = jst_now()
+                    for raw_symbol in symbols:
+                        canonical = resolver.canonicalize(raw_symbol)
+                        match = news_filter.match(canonical, now)
+                        if match is None:
+                            continue
+                        skipped_news_symbols.add(raw_symbol)
+                        logger.info(
+                            "Webhook skipped by news filter: symbol=%s currencies=%s event=%s %s %s impact=%s window=%s-%s",
+                            canonical,
+                            ",".join(match.symbol_currencies),
+                            match.event.time,
+                            match.event.country,
+                            match.event.name,
+                            match.event.impact_label,
+                            match.window_start.strftime("%Y-%m-%d %H:%M JST"),
+                            match.window_end.strftime("%Y-%m-%d %H:%M JST"),
+                        )
+                        if app_config.news_filter.notify_on_skip:
+                            notify_payload = with_discord_skip_context(
+                                payload,
+                                "news_filter",
+                                news_skip_message(match),
+                                news_filter_discord_title(app_config.news_filter),
+                            )
+                            discord_thread = threading.Thread(
+                                target=send_discord_alert,
+                                args=(app_config.discord, canonical, side, notify_payload, logger),
+                                name="tv-mt5-discord-alert",
+                                daemon=True,
+                            )
+                            discord_thread.start()
+                        news_results.append(
+                            {
+                                "skipped": True,
+                                "reason": "news_filter",
+                                "symbol": raw_symbol,
+                                "canonical_symbol": canonical,
+                                "action": payload.get("action"),
+                                "side": side,
+                                "discord_notify_requested": app_config.news_filter.notify_on_skip,
+                                "news_event": {
+                                    "time": match.event.time,
+                                    "country": match.event.country,
+                                    "currency": match.event.currency,
+                                    "impact": match.event.impact_label,
+                                    "name": match.event.name,
+                                    "forecast": match.event.forecast,
+                                    "previous": match.event.previous,
+                                },
+                                "news_window": {
+                                    "start": match.window_start.isoformat(),
+                                    "end": match.window_end.isoformat(),
+                                    "minutes_before": app_config.news_filter.minutes_before,
+                                    "minutes_after": app_config.news_filter.minutes_after,
+                                    "timezone": "Asia/Tokyo",
+                                },
+                            }
+                        )
+                    if news_results:
+                        if len(skipped_news_symbols) == len(symbols):
+                            self._respond(200, {"ok": True, "results": news_results})
+                            return
+                        pre_results = news_results
+                        symbols = [raw_symbol for raw_symbol in symbols if raw_symbol not in skipped_news_symbols]
+
                 strategy_id = str(payload.get("strategy_id") or "").strip() or None
                 strategy_label = str(payload.get("strategy_label") or "").strip()
                 entry_only = bool(payload.get("entry_only", False))
                 skip_scope = str(payload.get("skip_scope") or "").strip().lower()
                 sl = None if entry_only else payload.get("sl")
                 tp = None if entry_only else payload.get("tp")
-                results: list[dict[str, Any]] = []
+                results: list[dict[str, Any]] = pre_results
 
+                tasks: list[tuple[str, str]] = []
                 for raw_symbol in symbols:
                     canonical_guess = resolver.canonicalize(raw_symbol)
                     profile_names = select_mt5_profile_names(app_config, payload, raw_symbol, canonical_guess)
                     for requested_profile_name in profile_names:
-                        profile_name, profile_cfg = app_config.mt5_profile_config(requested_profile_name)
-                        selected_trader = MT5Trader(profile_cfg, app_config.dry_run, logger)
-                        selected_resolver = SymbolResolver(app_config.symbols, logger)
-                        try:
-                            with selected_trader._lock:
-                                if mt5 is not None:
-                                    selected_trader.connect()
-                                resolved_symbol, canonical = selected_resolver.resolve(raw_symbol)
-                                if action_kind == "entry":
-                                    side = action_side or "buy"
-                                    counts = {"buy": 0, "sell": 0, "total": 0}
-                                    if app_config.entry.skip_same_side_position:
-                                        counts_strategy_id = strategy_id if skip_scope == "strategy" else None
-                                        counts = selected_trader.get_position_counts(resolved_symbol, strategy_id=counts_strategy_id)
-                                        same_count = counts["buy"] if side in {"buy", "long"} else counts["sell"]
+                        profile_name, _ = app_config.mt5_profile_config(requested_profile_name)
+                        tasks.append((raw_symbol, profile_name))
 
-                                        if same_count > 0:
-                                            item = {
-                                                "raw_symbol": raw_symbol,
-                                                "canonical_symbol": canonical,
-                                                "resolved_symbol": resolved_symbol,
-                                                "mt5_profile": profile_name,
-                                                "skipped": True,
-                                                "reason": "same_side_position_exists",
-                                                "side": side,
-                                                "existing_positions": counts,
-                                            }
-                                            if strategy_id:
-                                                item["strategy_id"] = strategy_id
-                                                item["strategy_label"] = strategy_label
-                                                item["position_scope"] = "strategy"
-                                            results.append(item)
-                                            continue
-
-                                    lot = lot_manager.resolve_lot(canonical, payload.get("lot"), profile_name)
-                                    pending_marker: Path | None = None
-                                    if strategy_id and skip_scope == "strategy" and not app_config.dry_run:
-                                        pending_marker = acquire_pending_entry(profile_cfg, resolved_symbol, side, strategy_id)
-                                        if pending_marker is None:
-                                            item = {
-                                                "raw_symbol": raw_symbol,
-                                                "canonical_symbol": canonical,
-                                                "resolved_symbol": resolved_symbol,
-                                                "mt5_profile": profile_name,
-                                                "skipped": True,
-                                                "reason": "duplicate_entry_pending",
-                                                "side": side,
-                                                "existing_positions": counts,
-                                                "strategy_id": strategy_id,
-                                                "strategy_label": strategy_label,
-                                                "position_scope": "strategy",
-                                            }
-                                            results.append(item)
-                                            continue
-
-                                    try:
-                                        result = selected_trader.market_order(
-                                            symbol=resolved_symbol,
-                                            side=side,
-                                            lot=lot,
-                                            sl=to_optional_float(sl),
-                                            tp=to_optional_float(tp),
-                                            strategy_id=strategy_id,
-                                        )
-                                    except Exception:
-                                        release_pending_entry(pending_marker)
-                                        raise
-                                    retcode = int(result.get("retcode") or 0) if isinstance(result, dict) else 0
-                                    if pending_marker is not None and retcode not in {10008, 10009}:
-                                        release_pending_entry(pending_marker)
-                                    item = {
-                                        "raw_symbol": raw_symbol,
-                                        "canonical_symbol": canonical,
-                                        "resolved_symbol": resolved_symbol,
-                                        "mt5_profile": profile_name,
-                                        "lot": lot,
-                                        "existing_positions": counts,
-                                        "result": result,
-                                    }
-                                    if strategy_id:
-                                        item["strategy_id"] = strategy_id
-                                        item["strategy_label"] = strategy_label
-                                        item["position_scope"] = "strategy"
-                                    results.append(item)
-                                else:
-                                    close_results = selected_trader.close_positions(
-                                        symbol=resolved_symbol,
-                                        side_filter=action_side,
-                                    )
-                                    results.append(
-                                        {
-                                            "raw_symbol": raw_symbol,
-                                            "canonical_symbol": canonical,
-                                            "resolved_symbol": resolved_symbol,
-                                            "mt5_profile": profile_name,
-                                            "closed": len(close_results),
-                                            "result": close_results,
-                                        }
-                                    )
-                        finally:
-                            selected_trader.shutdown()
+                if tasks:
+                    with ThreadPoolExecutor(max_workers=len(tasks)) as executor:
+                        futures = [
+                            executor.submit(
+                                worker_pool.submit,
+                                profile_name,
+                                "handle_action",
+                                {
+                                    "raw_symbol": raw_symbol,
+                                    "action_kind": action_kind,
+                                    "action_side": action_side,
+                                    "strategy_id": strategy_id,
+                                    "strategy_label": strategy_label,
+                                    "skip_scope": skip_scope,
+                                    "sl": sl,
+                                    "tp": tp,
+                                    "lot_override": payload.get("lot"),
+                                },
+                            )
+                            for raw_symbol, profile_name in tasks
+                        ]
+                        for future in futures:
+                            results.append(future.result())
 
                 if action_kind == "entry":
                     side = action_side or "buy"
                     for raw_symbol in symbols:
+                        symbol_results = [
+                            item for item in results
+                            if item.get("raw_symbol") == raw_symbol or item.get("symbol") == raw_symbol
+                        ]
+                        notify_payload = payload
+                        same_side_items = [
+                            item for item in symbol_results
+                            if item.get("reason") == "same_side_position_exists"
+                        ]
+                        if same_side_items:
+                            notify_payload = with_discord_skip_context(
+                                payload,
+                                "same_side_position_exists",
+                                "",
+                            )
                         discord_thread = threading.Thread(
                             target=send_discord_alert,
-                            args=(app_config.discord, resolver.canonicalize(raw_symbol), side, payload, logger),
+                            args=(app_config.discord, resolver.canonicalize(raw_symbol), side, notify_payload, logger),
                             name="tv-mt5-discord-alert",
                             daemon=True,
                         )
@@ -1423,11 +2480,13 @@ def main() -> None:
         raise FileNotFoundError(f"Config not found: {cfg_path}")
 
     app_config = AppConfig.load(cfg_path)
-    trader = MT5Trader(app_config.mt5, app_config.dry_run, logger)
+    worker_pool = Mt5WorkerPool(app_config, logger)
+    worker_pool.start_all()
     resolver = SymbolResolver(app_config.symbols, logger)
-    lot_manager = LotManager(app_config.risk)
+    news_filter = NewsFilter(app_config.news_filter, logger)
+    news_filter.start()
 
-    handler = create_handler(app_config, trader, resolver, lot_manager, logger)
+    handler = create_handler(app_config, worker_pool, resolver, news_filter, logger)
     server = ThreadingHTTPServer((app_config.webhook.host, app_config.webhook.port), handler)
     logger.info("Webhook server started: http://%s:%s/webhook", app_config.webhook.host, app_config.webhook.port)
     logger.info("Dry run mode: %s", app_config.dry_run)
@@ -1438,7 +2497,8 @@ def main() -> None:
         logger.info("Stopping server")
     finally:
         server.server_close()
-        trader.shutdown()
+        worker_pool.stop()
+        news_filter.stop()
 
 
 if __name__ == "__main__":
